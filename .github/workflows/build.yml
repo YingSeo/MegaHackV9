@@ -14,42 +14,75 @@ jobs:
         with:
           arch: x64
 
-      - name: Compile Mega Hack v9 Pro DLL & Package .geode
+      - name: Compile DLL, Generate Logo & Package .geode
         shell: pwsh
         run: |
-          # 1. Biên dịch trực tiếp src/main.cpp bằng MSVC C++20 + OpenGL
+          # 1. Biên dịch trực tiếp src/main.cpp bằng MSVC C++20
           cl.exe /nologo /std:c++20 /O2 /EHsc /MD /LD src/main.cpp user32.lib gdi32.lib opengl32.lib winmm.lib psapi.lib /Fe:absolute.megahack_v9.dll
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # 2. Tạo bản nạp trực tiếp xinput1_4.dll (chép thẳng vào thư mục Geometry Dash)
-          Copy-Item "absolute.megahack_v9.dll" "xinput1_4.dll"
-
-          # 3. Tạo thư mục đóng gói chuẩn cấu trúc gốc .geode
           New-Item -ItemType Directory -Force -Path "pkg" | Out-Null
           Copy-Item "absolute.megahack_v9.dll" "pkg/absolute.megahack_v9.dll"
 
-          $modJson = @{
-            geode = "4.4.0"
-            gd = @{
-              win = "*"
-              android = "*"
-              mac = "*"
+          # 2. Tự động vẽ logo.png (128x128 Crimson MHv9) để không còn chữ N/A
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap(128, 128)
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+          $g.Clear([System.Drawing.Color]::FromArgb(255, 18, 18, 24))
+          $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 220, 42, 42), 6)
+          $g.DrawRectangle($pen, 6, 6, 116, 116)
+          $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 235, 55, 55))
+          $font1 = New-Object System.Drawing.Font("Segoe UI", 26, [System.Drawing.FontStyle]::Bold)
+          $font2 = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+          $g.DrawString("MH", $font1, $brush, 22, 20)
+          $whiteBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+          $g.DrawString("v9 PRO", $font2, $whiteBrush, 20, 72)
+          $g.Dispose()
+          $bmp.Save("$PWD/pkg/logo.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+
+          # 3. Tự động lấy phiên bản Geode mới nhất (Geode 5.x cho GD 2.2081)
+          $latestGeode = "5.0.0"
+          try {
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/geode-sdk/geode/releases/latest" -TimeoutSec 10
+            if ($rel.tag_name) {
+              $latestGeode = $rel.tag_name.TrimStart('v')
             }
-            id = "absolute.megahack_v9"
-            name = "Mega Hack v9 Pro"
-            version = "v9.9.0"
-            developer = "Absolute"
-            description = "Mega Hack v9.9.0 Ultimate + QOLMod Engine for Geometry Dash 2.2081. Press TAB to toggle."
-            tags = @("gameplay", "interface", "utility", "enhancement", "cheats")
-          } | ConvertTo-Json -Depth 5
-          Set-Content -Path "pkg/mod.json" -Value $modJson -Encoding UTF8
+          } catch {
+            $latestGeode = "5.0.0"
+          }
 
-          Set-Content -Path "pkg/about.md" -Value "# Mega Hack v9 Pro`nPress **TAB** in-game to toggle the 6-column Mega Hack v9 interface." -Encoding UTF8
-          Set-Content -Path "pkg/changelog.md" -Value "# v9.9.0`n- Full OpenGL + Engine Hook release for Geometry Dash 2.2081." -Encoding UTF8
+          function Build-GeodePackage($targetGeodeVer, $outFileName) {
+            $modJson = [ordered]@{
+              geode = $targetGeodeVer
+              gd = @{
+                win = "2.2081"
+                android = "2.2081"
+                mac = "2.2081"
+                ios = "2.2081"
+              }
+              id = "absolute.megahack_v9"
+              name = "Mega Hack v9 Pro"
+              version = "v10.0.0"
+              developer = "Absolute"
+              description = "Mega Hack v9 Pro Ultimate Engine for Geometry Dash 2.2081. Press TAB in-game to open."
+              tags = @("gameplay", "interface", "utility", "enhancement", "cheats")
+              "early-load" = $true
+            } | ConvertTo-Json -Depth 5
 
-          # 4. Nén từ bên trong thư mục pkg để mod.json nằm đúng ở tầng gốc (Root)
-          Compress-Archive -Path "pkg/*" -DestinationPath "absolute.megahack_v9.zip" -Force
-          Move-Item -Path "absolute.megahack_v9.zip" -Destination "absolute.megahack_v9.geode" -Force
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText("$PWD/pkg/mod.json", $modJson, $utf8NoBom)
+            [System.IO.File]::WriteAllText("$PWD/pkg/about.md", "# Mega Hack v9 Pro (v10.0.0)`nPress **TAB** in-game to open the Mega Hack v9 menu.", $utf8NoBom)
+            [System.IO.File]::WriteAllText("$PWD/pkg/changelog.md", "# v10.0.0`n- Fixed Geode 5.x compatibility, added native Cocos2d-x Speedhack, Inline OpenGL Hook, WndProc Input Blocker, and RGB/Particle submenus.", $utf8NoBom)
+
+            Compress-Archive -Path "pkg/*" -DestinationPath "temp_pkg.zip" -Force
+            Move-Item -Path "temp_pkg.zip" -Destination $outFileName -Force
+          }
+
+          # Xuất bản chính khớp Geode mới nhất và bản dự phòng 5.0.0
+          Build-GeodePackage $latestGeode "absolute.megahack_v9.geode"
+          Build-GeodePackage "5.0.0" "absolute.megahack_v9_geode5.geode"
 
       - name: Upload Mega Hack v9 Pro Artifacts
         uses: actions/upload-artifact@v4
@@ -57,4 +90,4 @@ jobs:
           name: MegaHackV9_Pro_GD22081
           path: |
             absolute.megahack_v9.geode
-            xinput1_4.dll
+            absolute.megahack_v9_geode5.geode
