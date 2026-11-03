@@ -1,13 +1,9 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/GameManager.hpp>
-#include <Geode/modify/PauseLayer.hpp>
-#include <Geode/modify/CCScheduler.hpp>
-#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/Bindings.hpp>
 #include <Geode/modify/MenuLayer.hpp>
-#include <Geode/modify/GJGarageLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/CCScheduler.hpp>
 #include <cmath>
 #include <vector>
 #include <deque>
@@ -19,18 +15,29 @@
 
 using namespace geode::prelude;
 
+// Direct Win32 Hardware Input API (Zero header macro conflicts)
+#ifdef GEODE_IS_WINDOWS
+extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int vKey);
+extern "C" __declspec(dllimport) void __stdcall mouse_event(
+    unsigned long dwFlags,
+    unsigned long dx,
+    unsigned long dy,
+    unsigned long dwData,
+    unsigned long long dwExtraInfo
+);
+#endif
+
 // ============================================================================
 // 1. GLOBAL ENGINE STATE & MACRO STRUCTURES (ALL DEFAULT TO OFF)
 // ============================================================================
 struct MacroTickAction {
     int tick;
     bool pressDown;
-    bool isPlayer1;
 };
 
-struct MegaHackProState {
+struct MegaHackUltimateState {
     bool menuOpen = false;
-    int animStyle = 0;   // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Pop
+    int animStyle = 0;   // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Scale
     int hudAnchor = 0;   // 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Top-Center
 
     // Column 1: Cosmetic & Visuals
@@ -48,6 +55,7 @@ struct MegaHackProState {
     bool layoutMode = false;
     bool playerOnTop = false;
     bool forceMiniIcon = false;
+    bool hidePlayer = false;
     bool p1RgbIcons = false;
     bool p2RgbIcons = false;
 
@@ -57,6 +65,7 @@ struct MegaHackProState {
     bool safeMode = false;
     bool autoSafeMode = true;
     bool shipcopter = false;
+    bool forceIce = false;
     bool showTrajectory = false;
     bool showHitboxes = false;
     bool showHitboxesOnDeath = false;
@@ -64,6 +73,7 @@ struct MegaHackProState {
     bool hitboxMultiplier = false;
     float hitboxScale = 0.50f;
     bool startPosSwitcher = false;
+    bool quickResetKey = false;
     bool fixedRandomSeed = false;
     unsigned int randomSeed = 1337;
     bool instantComplete = false;
@@ -94,12 +104,18 @@ struct MegaHackProState {
     bool showBestRun = false;
 
     // Column 6: Bypass & Macro Replay Bot
-    bool iconBypass = false;
     int macroMode = 0; // 0: Disabled, 1: Recording, 2: Playback
     std::vector<MacroTickAction> macroBuffer;
     size_t macroCursor = 0;
     int physicsTick = 0;
-    bool replayingInputNow = false;
+
+    // Hardware Key Edge States
+    bool prevTabDown = false;
+    bool prevCDown = false;
+    bool prevQDown = false;
+    bool prevEDown = false;
+    bool prevRDown = false;
+    bool prevJumpDown = false;
 
     // Runtime Level Tracking
     std::vector<cocos2d::CCPoint> startPosList;
@@ -116,8 +132,8 @@ struct MegaHackProState {
     float bestRunFrom = 0.0f;
     float bestRunTo = 0.0f;
     float maxLevelX = 2400.0f;
+    float iceDriftVelX = 0.0f;
     std::vector<float> clickTimestamps;
-    bool holdingJump = false;
     float rgbHue = 0.0f;
     std::deque<cocos2d::CCRect> hitboxTrailHistory;
 
@@ -125,7 +141,7 @@ struct MegaHackProState {
     cocos2d::CCPoint p1VelSmooth = {0.f, 0.f};
 
     bool isCheating() const {
-        return noclip || noCollision || shipcopter ||
+        return noclip || noCollision || shipcopter || forceIce ||
                showTrajectory || showHitboxes || hitboxMultiplier ||
                layoutMode || fixedRandomSeed || instantComplete ||
                frameStepper || autoClicker || (macroMode == 2) ||
@@ -150,11 +166,11 @@ struct MegaHackProState {
         mod->setSavedValue("p2RgbIcons", p2RgbIcons);
         mod->setSavedValue("autoSafeMode", autoSafeMode);
         mod->setSavedValue("startPosSwitcher", startPosSwitcher);
+        mod->setSavedValue("quickResetKey", quickResetKey);
         mod->setSavedValue("customBackground", customBackground);
         mod->setSavedValue("bgThemeIdx", bgThemeIdx);
         mod->setSavedValue("hudAnchor", hudAnchor);
         mod->setSavedValue("animStyle", animStyle);
-        mod->setSavedValue("iconBypass", iconBypass);
         mod->setSavedValue("cheatIndicator", cheatIndicator);
         mod->setSavedValue("showFps", showFps);
         mod->setSavedValue("showCps", showCps);
@@ -165,7 +181,7 @@ struct MegaHackProState {
     }
 };
 
-static MegaHackProState g_mh;
+static MegaHackUltimateState g_mh;
 
 struct ToggleCallbackData : public cocos2d::CCObject {
     bool* statePtr = nullptr;
@@ -180,7 +196,7 @@ struct ActionCallbackData : public cocos2d::CCObject {
 };
 
 // ============================================================================
-// 2. PURE COCOS2D-X HELPER FUNCTIONS (ZERO BINDING CONFLICTS)
+// 2. PURE COCOS2D-X HELPER FUNCTIONS
 // ============================================================================
 static std::string formatFloat(const char* prefix, float val, const char* suffix, int decimals = 2) {
     std::ostringstream ss;
@@ -254,6 +270,15 @@ static void switchStartPos(int dir) {
     cocos2d::CCPoint target = g_mh.startPosList[g_mh.currentStartPosIdx];
     if (pl->m_player1) pl->m_player1->setPosition(target);
     if (pl->m_player2) pl->m_player2->setPosition(target);
+}
+
+static void synthesizeJumpHold(bool pressDown) {
+#ifdef GEODE_IS_WINDOWS
+    // 0x0002 = MOUSEEVENTF_LEFTDOWN, 0x0004 = MOUSEEVENTF_LEFTUP
+    mouse_event(pressDown ? 0x0002UL : 0x0004UL, 0, 0, 0, 0);
+#else
+    (void)pressDown;
+#endif
 }
 
 // ============================================================================
@@ -500,7 +525,7 @@ public:
     }
 
     void buildCosmeticColumn(cocos2d::CCPoint pos, float w) {
-        float h = 205.0f;
+        float h = 218.0f;
         auto col = createColumnBox("Cosmetic", pos, w, h);
         float y = h - 21.0f;
 
@@ -523,12 +548,13 @@ public:
         addToggleRow(col, y, "Layout Mode", &g_mh.layoutMode);
         addToggleRow(col, y, "Player on Top", &g_mh.playerOnTop);
         addToggleRow(col, y, "Force Mini Icon", &g_mh.forceMiniIcon);
+        addToggleRow(col, y, "Hide Player", &g_mh.hidePlayer);
         addToggleRow(col, y, "P1 RGB Icons", &g_mh.p1RgbIcons);
         addToggleRow(col, y, "P2 RGB Icons", &g_mh.p2RgbIcons);
     }
 
     void buildLevelColumn(cocos2d::CCPoint pos, float w) {
-        float h = 242.0f;
+        float h = 268.0f;
         auto col = createColumnBox("Level", pos, w, h);
         float y = h - 21.0f;
 
@@ -537,6 +563,7 @@ public:
         addToggleRow(col, y, "Safe Mode", &g_mh.safeMode);
         addToggleRow(col, y, "Auto Safe Mode", &g_mh.autoSafeMode);
         addToggleRow(col, y, "Shipcopter Fly", &g_mh.shipcopter);
+        addToggleRow(col, y, "Force Ice Drift", &g_mh.forceIce);
         addToggleRow(col, y, "Show Trajectory", &g_mh.showTrajectory);
         addToggleRow(col, y, "Show Hitboxes", &g_mh.showHitboxes);
         addToggleRow(col, y, "Hitboxes on Death", &g_mh.showHitboxesOnDeath);
@@ -551,6 +578,7 @@ public:
             }
         });
         addToggleRow(col, y, "StartPos Switch [Q/E]", &g_mh.startPosSwitcher);
+        addToggleRow(col, y, "Quick Reset [R]", &g_mh.quickResetKey);
         addToggleRow(col, y, "Random Seed", &g_mh.fixedRandomSeed);
         addStepperRow(col, y, "Seed: 1337", &m_seedLbl, [this](int dir) {
             g_mh.randomSeed = static_cast<unsigned int>(std::max(1, static_cast<int>(g_mh.randomSeed) + dir * 111));
@@ -599,7 +627,7 @@ public:
             g_mh.saveToDisk();
         });
         addActionButtonRow(col, y, "Reset All OFF", nullptr, []() {
-            g_mh = MegaHackProState();
+            g_mh = MegaHackUltimateState();
             g_mh.menuOpen = true;
             cocos2d::CCApplication::sharedApplication()->setAnimationInterval(1.0 / 240.0);
         });
@@ -655,10 +683,8 @@ public:
 
     void buildBypassBotColumn(cocos2d::CCPoint pos, float w) {
         float h = 180.0f;
-        auto col = createColumnBox("Bypass & Bot", pos, w, h);
+        auto col = createColumnBox("Macro & Utility", pos, w, h);
         float y = h - 21.0f;
-
-        addToggleRow(col, y, "Unlock All Icons", &g_mh.iconBypass);
 
         addActionButtonRow(col, y, "Bot: Disabled", &m_botLbl, [this]() {
             g_mh.macroMode = (g_mh.macroMode + 1) % 3;
@@ -678,6 +704,10 @@ public:
             g_mh.macroCursor = 0;
             g_mh.macroMode = 0;
             if (m_botLbl) m_botLbl->setString("Bot: Disabled");
+        });
+
+        addActionButtonRow(col, y, "Restart Level [R]", nullptr, []() {
+            if (auto pl = PlayLayer::get()) pl->resetLevel();
         });
     }
 
@@ -799,113 +829,7 @@ static cocos2d::CCMenuItemSprite* createPillButton(const char* text, cocos2d::CC
 }
 
 // ============================================================================
-// 4. KEYBOARD HOOK (TAB MENU, 'C' FRAME STEPPER, 'Q'/'E' STARTPOS SWITCHER)
-// ============================================================================
-class $modify(MHKeyHook, cocos2d::CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool isKeyDown, bool isKeyRepeat) {
-        if (key == cocos2d::enumKeyCodes::KEY_Tab && isKeyDown && !isKeyRepeat) {
-            if (auto ui = MegaHackV9Overlay::getOrCreate()) {
-                ui->toggleMenu();
-                return true;
-            }
-        }
-        if (g_mh.frameStepper && key == cocos2d::enumKeyCodes::KEY_C && isKeyDown) {
-            g_mh.stepRequested = true;
-            return true;
-        }
-        if (g_mh.startPosSwitcher && isKeyDown && !isKeyRepeat && PlayLayer::get()) {
-            if (key == cocos2d::enumKeyCodes::KEY_Q) {
-                switchStartPos(-1);
-                return true;
-            }
-            if (key == cocos2d::enumKeyCodes::KEY_E) {
-                switchStartPos(+1);
-                return true;
-            }
-        }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat);
-    }
-};
-
-// ============================================================================
-// 5. GAME MANAGER HOOKS (UNLOCK ALL ICONS & COLORS)
-// ============================================================================
-class $modify(MHGameManagerHook, GameManager) {
-    bool isIconUnlocked(int id, IconType type) {
-        if (g_mh.iconBypass) return true;
-        return GameManager::isIconUnlocked(id, type);
-    }
-
-    bool isColorUnlocked(int id, UnlockType type) {
-        if (g_mh.iconBypass) return true;
-        return GameManager::isColorUnlocked(id, type);
-    }
-};
-
-// ============================================================================
-// 6. SPEEDHACK HOOK (CCScheduler)
-// ============================================================================
-class $modify(MHSchedulerHook, cocos2d::CCScheduler) {
-    void update(float dt) {
-        if (g_mh.speedhackEnabled && g_mh.speedhackValue > 0.01f) {
-            dt *= g_mh.speedhackValue;
-        }
-        CCScheduler::update(dt);
-    }
-};
-
-// ============================================================================
-// 7. PLAYER OBJECT HOOKS (CPS, MACRO RECORDING, SHIPCOPTER, BALL BUG, MINI)
-// ============================================================================
-class $modify(MHPlayerHook, PlayerObject) {
-    bool pushButton(PlayerButton p0) {
-        if (p0 == PlayerButton::Jump && PlayLayer::get()) {
-            if (!g_mh.holdingJump) {
-                g_mh.holdingJump = true;
-                float now = cocos2d::CCDirector::sharedDirector()->getTotalFrames() / 60.0f;
-                g_mh.clickTimestamps.push_back(now);
-            }
-            if (g_mh.macroMode == 1 && !g_mh.replayingInputNow) {
-                auto pl = PlayLayer::get();
-                bool isP1 = (pl && this == pl->m_player1);
-                g_mh.macroBuffer.push_back({g_mh.physicsTick, true, isP1});
-            }
-        }
-        return PlayerObject::pushButton(p0);
-    }
-
-    bool releaseButton(PlayerButton p0) {
-        if (p0 == PlayerButton::Jump && PlayLayer::get()) {
-            g_mh.holdingJump = false;
-            if (g_mh.macroMode == 1 && !g_mh.replayingInputNow) {
-                auto pl = PlayLayer::get();
-                bool isP1 = (pl && this == pl->m_player1);
-                g_mh.macroBuffer.push_back({g_mh.physicsTick, false, isP1});
-            }
-        }
-        return PlayerObject::releaseButton(p0);
-    }
-
-    void update(float dt) {
-        PlayerObject::update(dt);
-
-        if (PlayLayer::get() && !g_mh.playerIsDead) {
-            if (g_mh.shipcopter) {
-                float lift = g_mh.holdingJump ? 1.90f : -1.50f;
-                this->setPositionY(std::max(0.0f, this->getPositionY() + lift * dt));
-            }
-            if (g_mh.ballRotationBug) {
-                this->setRotation(this->getRotation() + 18.5f * dt);
-            }
-            if (g_mh.forceMiniIcon) {
-                this->setScale(0.6f);
-            }
-        }
-    }
-};
-
-// ============================================================================
-// 8. PLAYLAYER & GJBASEGAMELAYER HOOKS (NOCLIP, HITBOX, TRAJECTORY, BOT, HUD)
+// 4. OVERLAY RENDERING & HUD ENGINE
 // ============================================================================
 static cocos2d::CCDrawNode* s_drawOverlay = nullptr;
 static cocos2d::CCLabelBMFont* s_hudLabel = nullptr;
@@ -1062,69 +986,152 @@ static void updateStatusHudOverlay(float dt) {
     s_hudLabel->setString(ss.str().c_str());
 }
 
-class $modify(MHBaseGameHook, GJBaseGameLayer) {
+// ============================================================================
+// 5. MASTER SCHEDULER HOOK (POLLS HARDWARE KEYS, SPEEDHACK, PHYSICS & RENDER)
+// ============================================================================
+class $modify(MHSchedulerHook, cocos2d::CCScheduler) {
     void update(float dt) {
         auto pl = PlayLayer::get();
-        bool isActivePlayLayer = (pl && static_cast<GJBaseGameLayer*>(pl) == this);
 
-        if (isActivePlayLayer) {
-            if (g_mh.frameStepper) {
-                if (!g_mh.stepRequested) return;
-                g_mh.stepRequested = false;
-                dt = 1.0f / 240.0f;
+#ifdef GEODE_IS_WINDOWS
+        // 1. Poll Hardware Keys (Tab, C, Q, E, R, Jump)
+        bool tabDown = (GetAsyncKeyState(0x09) & 0x8000) != 0; // VK_TAB
+        if (tabDown && !g_mh.prevTabDown) {
+            if (auto ui = MegaHackV9Overlay::getOrCreate()) {
+                ui->toggleMenu();
             }
+        }
+        g_mh.prevTabDown = tabDown;
 
+        bool cDown = (GetAsyncKeyState('C') & 0x8000) != 0;
+        if (cDown && !g_mh.prevCDown && g_mh.frameStepper) {
+            g_mh.stepRequested = true;
+        }
+        g_mh.prevCDown = cDown;
+
+        bool qDown = (GetAsyncKeyState('Q') & 0x8000) != 0;
+        if (qDown && !g_mh.prevQDown && g_mh.startPosSwitcher && pl) {
+            switchStartPos(-1);
+        }
+        g_mh.prevQDown = qDown;
+
+        bool eDown = (GetAsyncKeyState('E') & 0x8000) != 0;
+        if (eDown && !g_mh.prevEDown && g_mh.startPosSwitcher && pl) {
+            switchStartPos(+1);
+        }
+        g_mh.prevEDown = eDown;
+
+        bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
+        if (rDown && !g_mh.prevRDown && g_mh.quickResetKey && pl && !g_mh.menuOpen) {
+            pl->resetLevel();
+        }
+        g_mh.prevRDown = rDown;
+
+        // Poll Jump Input (Mouse Left, Space, Up Arrow, W) for CPS, Shipcopter & Macro Bot
+        bool jumpDown = ((GetAsyncKeyState(0x01) & 0x8000) != 0) ||
+                        ((GetAsyncKeyState(0x20) & 0x8000) != 0) ||
+                        ((GetAsyncKeyState(0x26) & 0x8000) != 0) ||
+                        ((GetAsyncKeyState('W')  & 0x8000) != 0);
+
+        if (pl && !g_mh.menuOpen) {
+            if (jumpDown && !g_mh.prevJumpDown) {
+                float now = cocos2d::CCDirector::sharedDirector()->getTotalFrames() / 60.0f;
+                g_mh.clickTimestamps.push_back(now);
+                if (g_mh.macroMode == 1) {
+                    g_mh.macroBuffer.push_back({g_mh.physicsTick, true});
+                }
+            } else if (!jumpDown && g_mh.prevJumpDown) {
+                if (g_mh.macroMode == 1) {
+                    g_mh.macroBuffer.push_back({g_mh.physicsTick, false});
+                }
+            }
+        }
+        g_mh.prevJumpDown = jumpDown;
+#endif
+
+        // 2. Frame Stepper Freeze Logic
+        float effectiveDt = dt;
+        if (pl && g_mh.frameStepper && !g_mh.menuOpen) {
+            if (g_mh.stepRequested) {
+                g_mh.stepRequested = false;
+                effectiveDt = 1.0f / 240.0f;
+            } else {
+                effectiveDt = 0.0f;
+            }
+        } else if (g_mh.speedhackEnabled && g_mh.speedhackValue > 0.01f) {
+            effectiveDt *= g_mh.speedhackValue;
+        }
+
+        if (pl && effectiveDt > 0.0f && !g_mh.playerIsDead && !g_mh.menuOpen) {
             g_mh.physicsTick++;
 
-            // Smart Auto Clicker
-            if (g_mh.autoClicker && !g_mh.playerIsDead && this->m_player1) {
-                g_mh.autoClickAccum += dt;
+            // 3. Auto Clicker Synthesis
+            if (g_mh.autoClicker) {
+                g_mh.autoClickAccum += effectiveDt;
                 float halfPeriod = 0.5f / static_cast<float>(std::max(1, g_mh.autoClickCps));
                 if (g_mh.autoClickAccum >= halfPeriod) {
                     g_mh.autoClickAccum = 0.0f;
                     g_mh.autoClickHeld = !g_mh.autoClickHeld;
-                    if (g_mh.autoClickHeld) {
-                        this->m_player1->pushButton(PlayerButton::Jump);
-                    } else {
-                        this->m_player1->releaseButton(PlayerButton::Jump);
-                    }
+                    synthesizeJumpHold(g_mh.autoClickHeld);
                 }
             }
 
-            // Deterministic Macro Playback
-            if (g_mh.macroMode == 2 && !g_mh.playerIsDead) {
-                g_mh.replayingInputNow = true;
+            // 4. Deterministic Macro Playback
+            if (g_mh.macroMode == 2) {
                 while (g_mh.macroCursor < g_mh.macroBuffer.size() &&
                        g_mh.macroBuffer[g_mh.macroCursor].tick <= g_mh.physicsTick) {
-                    const auto& act = g_mh.macroBuffer[g_mh.macroCursor];
-                    PlayerObject* targetPlayer = act.isPlayer1 ? this->m_player1 : (this->m_player2 ? this->m_player2 : this->m_player1);
-                    if (targetPlayer) {
-                        if (act.pressDown) {
-                            targetPlayer->pushButton(PlayerButton::Jump);
-                        } else {
-                            targetPlayer->releaseButton(PlayerButton::Jump);
-                        }
-                    }
+                    synthesizeJumpHold(g_mh.macroBuffer[g_mh.macroCursor].pressDown);
                     g_mh.macroCursor++;
                 }
-                g_mh.replayingInputNow = false;
             }
         }
 
         g_mh.collidingThisFrame = false;
-        GJBaseGameLayer::update(dt);
+        CCScheduler::update(effectiveDt);
 
-        if (isActivePlayLayer && pl) {
+        // 5. Post-Tick PlayLayer Visuals & Physics Modifiers
+        pl = PlayLayer::get();
+        if (pl && effectiveDt > 0.0f) {
             g_mh.totalFrames++;
 
-            if (g_mh.noMirrorPortal && this->getScaleX() < 0.0f) {
-                this->setScaleX(std::abs(this->getScaleX()));
+            if (g_mh.noMirrorPortal && pl->getScaleX() < 0.0f) {
+                pl->setScaleX(std::abs(pl->getScaleX()));
             }
             if (g_mh.noCameraShake) {
-                this->setRotation(0.0f);
+                pl->setRotation(0.0f);
             }
 
-            // Frame Extrapolation visual smoothing
+            if (pl->m_player1 && !g_mh.playerIsDead) {
+                // Shipcopter Free-Fly
+                if (g_mh.shipcopter) {
+                    float lift = g_mh.prevJumpDown ? 210.0f : -175.0f;
+                    pl->m_player1->setPositionY(std::max(0.0f, pl->m_player1->getPositionY() + lift * effectiveDt));
+                }
+
+                // Force Ice Slippery Drift
+                if (g_mh.forceIce) {
+                    float targetSlide = g_mh.prevJumpDown ? 45.0f : -15.0f;
+                    g_mh.iceDriftVelX = g_mh.iceDriftVelX * 0.96f + targetSlide * 0.04f;
+                    pl->m_player1->setPositionY(std::max(0.0f, pl->m_player1->getPositionY() + g_mh.iceDriftVelX * effectiveDt * 0.25f));
+                }
+
+                // 2.0 Ball Rotation Bug
+                if (g_mh.ballRotationBug) {
+                    pl->m_player1->setRotation(pl->m_player1->getRotation() + 420.0f * effectiveDt);
+                }
+
+                // Force Mini Icon
+                if (g_mh.forceMiniIcon) {
+                    pl->m_player1->setScale(0.6f);
+                    if (pl->m_player2) pl->m_player2->setScale(0.6f);
+                }
+
+                // Hide Player
+                pl->m_player1->setVisible(!g_mh.hidePlayer);
+                if (pl->m_player2) pl->m_player2->setVisible(!g_mh.hidePlayer);
+            }
+
+            // Frame Extrapolation Sub-Frame Smoothing
             if (g_mh.frameExtrapolation && pl->m_player1 && !g_mh.playerIsDead) {
                 cocos2d::CCPoint cur = pl->m_player1->getPosition();
                 cocos2d::CCPoint delta = {cur.x - g_mh.p1PrevPos.x, cur.y - g_mh.p1PrevPos.y};
@@ -1133,7 +1140,7 @@ class $modify(MHBaseGameHook, GJBaseGameLayer) {
                         g_mh.p1VelSmooth.x * 0.65f + delta.x * 0.35f,
                         g_mh.p1VelSmooth.y * 0.65f + delta.y * 0.35f
                     };
-                    float alpha = std::clamp((dt * g_mh.targetFps) - 1.0f, 0.0f, 0.85f);
+                    float alpha = std::clamp((effectiveDt * g_mh.targetFps) - 1.0f, 0.0f, 0.85f);
                     pl->m_player1->setPosition({
                         cur.x + g_mh.p1VelSmooth.x * alpha * 0.25f,
                         cur.y + g_mh.p1VelSmooth.y * alpha * 0.25f
@@ -1151,7 +1158,7 @@ class $modify(MHBaseGameHook, GJBaseGameLayer) {
                 if (pl->m_player2) pl->m_player2->setZOrder(10000);
             }
 
-            // No Glow, No Particles & Layout Mode via standard dynamic_cast
+            // No Glow, No Particles & Layout Mode
             if (g_mh.noGlow || g_mh.noParticles || g_mh.layoutMode) {
                 if (auto objLayer = pl->getChildByID("object-layer")) {
                     if (auto children = objLayer->getChildren()) {
@@ -1177,7 +1184,7 @@ class $modify(MHBaseGameHook, GJBaseGameLayer) {
             }
 
             // P1 & P2 RGB Icons
-            g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * 145.0f, 360.0f);
+            g_mh.rgbHue = std::fmod(g_mh.rgbHue + effectiveDt * 145.0f, 360.0f);
             auto c1 = hsvToRgb(g_mh.rgbHue, 0.85f, 1.0f);
             auto c2 = hsvToRgb(std::fmod(g_mh.rgbHue + 180.0f, 360.0f), 0.85f, 1.0f);
 
@@ -1211,11 +1218,14 @@ class $modify(MHBaseGameHook, GJBaseGameLayer) {
                 }
             }
 
-            updateStatusHudOverlay(dt);
+            updateStatusHudOverlay(effectiveDt);
         }
     }
 };
 
+// ============================================================================
+// 6. CORE PLAYLAYER, PAUSELAYER & MENULAYER HOOKS
+// ============================================================================
 class $modify(MHPlayLayerHook, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         g_mh.inPlayLayerInit = true;
@@ -1243,7 +1253,7 @@ class $modify(MHPlayLayerHook, PlayLayer) {
         s_indicatorDot->setVisible(false);
         this->addChild(s_indicatorDot, 9998);
 
-        // QOLMod-style On-Screen StartPos Switcher Widget (< 1 / 6 >)
+        // On-Screen StartPos Switcher Bar (< 1 / 6 >)
         if (auto uiTarget = MegaHackV9Overlay::getOrCreate()) {
             s_startPosBar = cocos2d::CCNode::create();
             s_startPosBar->setPosition({winSize.width * 0.5f, 18.0f});
@@ -1325,7 +1335,7 @@ class $modify(MHPlayLayerHook, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        auto objNode = reinterpret_cast<cocos2d::CCNode*>(obj);
+        auto objNode = static_cast<cocos2d::CCNode*>(obj);
         if (g_mh.inPlayLayerInit || g_mh.totalFrames < 4 || (objNode && objNode->getParent() == nullptr)) {
             PlayLayer::destroyPlayer(player, obj);
             return;
@@ -1365,9 +1375,6 @@ class $modify(MHPlayLayerHook, PlayLayer) {
     }
 };
 
-// ============================================================================
-// 9. PAUSE LAYER, GARAGE & MENU HOOKS (PURE COCOS2D-X PILL BUTTONS)
-// ============================================================================
 class $modify(MHPauseHook, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
@@ -1389,14 +1396,6 @@ class $modify(MHMenuHook, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
         applyCustomMenuBg(this);
-        return true;
-    }
-};
-
-class $modify(MHGarageHook, GJGarageLayer) {
-    bool init() {
-        if (!GJGarageLayer::init()) return false;
-        applyCustomMenuBg(this);
 
         if (auto uiTarget = MegaHackV9Overlay::getOrCreate()) {
             auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
@@ -1404,7 +1403,7 @@ class $modify(MHGarageHook, GJGarageLayer) {
             menu->setPosition({0.f, 0.f});
             this->addChild(menu, 100);
 
-            auto btn = createPillButton("MHv9 RGB", uiTarget, menu_selector(MegaHackV9Overlay::onExternalToggleButton));
+            auto btn = createPillButton("MHv9 [Tab]", uiTarget, menu_selector(MegaHackV9Overlay::onExternalToggleButton));
             btn->setPosition({winSize.width - 42.0f, winSize.height - 18.0f});
             menu->addChild(btn);
         }
