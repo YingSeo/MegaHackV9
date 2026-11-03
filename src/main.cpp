@@ -4,6 +4,7 @@
 #include <mmsystem.h>
 #include <psapi.h>
 #include <GL/gl.h>
+#include "MinHook.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -20,14 +21,14 @@
 #include <fstream>
 
 // ============================================================================
-// 1. GEODE ENTRY POINT EXPORT (GIÚP GEODE 5.X NHẬN DIỆN & KÍCH HOẠT MOD CHUẨN)
+// 1. GEODE IMPLICIT LOAD EXPORT
 // ============================================================================
 extern "C" __declspec(dllexport) void geode_implicit_load(void* modPtr) {
     (void)modPtr;
 }
 
 // ============================================================================
-// 2. COMPLETE MEGA HACK V9 PRO + QOLMOD STATE (ALL OFF BY DEFAULT)
+// 2. COMPLETE MEGA HACK V9 PRO STATE (ALL OFF BY DEFAULT)
 // ============================================================================
 struct MacroEvent {
     int tick;
@@ -40,9 +41,8 @@ struct TrailPoint {
 };
 
 struct MegaHackV9Engine {
-    // UI & Animation State
     bool menuOpen = false;
-    int activePopup = 0;       // 0: None, 1: Particle Filter, 2: Custom BG RGB, 3: Icon RGB Effects
+    int activePopup = 0;       // 0: None, 1: Particle Filter, 2: Custom BG RGB, 3: Icon RGB Speed
     float animProgress = 0.0f; // 0.0 -> 1.0
     int animStyle = 0;         // 0: Smooth Cascade, 1: Slide Down, 2: Elastic Pop, 3: Instant
     int hudAnchor = 0;         // 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Top-Center
@@ -92,7 +92,6 @@ struct MegaHackV9Engine {
 
     // Column 3: Universal & Window
     bool customBackground = false;
-    int bgThemeIdx = 0;
     float customBgR = 0.12f;
     float customBgG = 0.14f;
     float customBgB = 0.26f;
@@ -121,7 +120,7 @@ struct MegaHackV9Engine {
     bool showBestRun = false;
     bool showClock = false;
 
-    // Column 6: Bypass, Creator & Macro Bot
+    // Column 6: Bypass & Macro Bot
     bool iconBypass = false;
     bool copyHack = false;
     bool verifyHack = false;
@@ -149,9 +148,13 @@ struct MegaHackV9Engine {
     float simPlayerY = 260.0f;
     float simPlayerVelY = 0.0f;
 
-    bool uiClickPending = false;
-    float uiClickX = 0.0f;
-    float uiClickY = 0.0f;
+    // Input Tracking
+    bool prevTabDown = false;
+    bool prevInsertDown = false;
+    bool prevMouseLeft = false;
+    bool prevCDown = false;
+    bool prevQDown = false;
+    bool prevEDown = false;
     bool prevJumpInput = false;
 
     bool isAnyCheatActive() const {
@@ -184,7 +187,6 @@ struct MegaHackV9Engine {
             << "startPosSwitcher=" << startPosSwitcher << "\n"
             << "practiceMusicSync=" << practiceMusicSync << "\n"
             << "customBackground=" << customBackground << "\n"
-            << "bgThemeIdx=" << bgThemeIdx << "\n"
             << "hudAnchor=" << hudAnchor << "\n"
             << "animStyle=" << animStyle << "\n"
             << "targetFps=" << targetFps << "\n"
@@ -221,7 +223,229 @@ struct MegaHackV9Engine {
 static MegaHackV9Engine g_mh;
 
 // ============================================================================
-// 3. COCOS2D-X NATIVE ENGINE BRIDGES & MEMORY PATCHING
+// 3. OPENGL 2.0+ STATE UNBINDER (FIXES BLANK MENU UNDER COCOS2D-X SHADERS)
+// ============================================================================
+#ifndef GL_CURRENT_PROGRAM
+#define GL_CURRENT_PROGRAM 0x8B8D
+#endif
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_ELEMENT_ARRAY_BUFFER
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#endif
+#ifndef GL_ARRAY_BUFFER_BINDING
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#endif
+#ifndef GL_TEXTURE0
+#define GL_TEXTURE0 0x84C0
+#endif
+
+using PFNGLUSEPROGRAMPROC = void(APIENTRY*)(GLuint);
+using PFNGLBINDBUFFERPROC = void(APIENTRY*)(GLenum, GLuint);
+using PFNGLBINDVERTEXARRAYPROC = void(APIENTRY*)(GLuint);
+using PFNGLACTIVETEXTUREPROC = void(APIENTRY*)(GLenum);
+
+static PFNGLUSEPROGRAMPROC pglUseProgram = nullptr;
+static PFNGLBINDBUFFERPROC pglBindBuffer = nullptr;
+static PFNGLBINDVERTEXARRAYPROC pglBindVertexArray = nullptr;
+static PFNGLACTIVETEXTUREPROC pglActiveTexture = nullptr;
+static bool g_glProcsResolved = false;
+
+static void resolveModernGLProcs() {
+    if (g_glProcsResolved) return;
+    HMODULE ogl = GetModuleHandleA("opengl32.dll");
+    if (!ogl) return;
+    using WglGetProcFn = PROC(WINAPI*)(LPCSTR);
+    auto getProc = reinterpret_cast<WglGetProcFn>(GetProcAddress(ogl, "wglGetProcAddress"));
+    if (!getProc) return;
+
+    pglUseProgram      = reinterpret_cast<PFNGLUSEPROGRAMPROC>(getProc("glUseProgram"));
+    pglBindBuffer      = reinterpret_cast<PFNGLBINDBUFFERPROC>(getProc("glBindBuffer"));
+    pglBindVertexArray = reinterpret_cast<PFNGLBINDVERTEXARRAYPROC>(getProc("glBindVertexArray"));
+    pglActiveTexture   = reinterpret_cast<PFNGLACTIVETEXTUREPROC>(getProc("glActiveTexture"));
+    if (pglUseProgram) {
+        g_glProcsResolved = true;
+    }
+}
+
+// ============================================================================
+// 4. ANTI-ALIASED TEXTURE FONT ATLAS (100% IMMUNE TO SHADER/RASTERPOS CLIPPING)
+// ============================================================================
+struct GlyphUV {
+    float u0, v0, u1, v1;
+    float advance;
+};
+
+static GLuint g_fontTexId = 0;
+static GlyphUV g_glyphs[128] = {};
+static const float kGlyphCellH = 20.0f;
+
+static void initFontTextureAtlas() {
+    if (g_fontTexId != 0) return;
+
+    const int texW = 512;
+    const int texH = 256;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = texW;
+    bmi.bmiHeader.biHeight = -texH; // Top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    uint32_t* dibPixels = nullptr;
+    HDC memDC = CreateCompatibleDC(nullptr);
+    HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, reinterpret_cast<void**>(&dibPixels), nullptr, 0);
+    if (!hBmp || !dibPixels) {
+        if (memDC) DeleteDC(memDC);
+        return;
+    }
+
+    HGDIOBJ oldBmp = SelectObject(memDC, hBmp);
+    std::memset(dibPixels, 0, texW * texH * sizeof(uint32_t));
+
+    HFONT hFont = CreateFontA(
+        -15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI"
+    );
+    HGDIOBJ oldFont = SelectObject(memDC, hFont);
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 255));
+
+    const int cols = 16;
+    const int cellW = 32;
+    const int cellH = 24;
+
+    for (int ch = 32; ch < 127; ++ch) {
+        int idx = ch - 32;
+        int cx = (idx % cols) * cellW;
+        int cy = (idx / cols) * cellH;
+        char buf[2] = {static_cast<char>(ch), 0};
+
+        SIZE sz = {};
+        GetTextExtentPoint32A(memDC, buf, 1, &sz);
+        TextOutA(memDC, cx + 2, cy + 2, buf, 1);
+
+        float adv = static_cast<float>(std::max(5L, sz.cx));
+        g_glyphs[ch].u0 = static_cast<float>(cx + 2) / static_cast<float>(texW);
+        g_glyphs[ch].v0 = static_cast<float>(cy + 2) / static_cast<float>(texH);
+        g_glyphs[ch].u1 = static_cast<float>(cx + 2 + adv + 2.0f) / static_cast<float>(texW);
+        g_glyphs[ch].v1 = static_cast<float>(cy + 2 + kGlyphCellH) / static_cast<float>(texH);
+        g_glyphs[ch].advance = adv;
+    }
+
+    // Convert RGB luminance to RGBA white with smooth alpha channel
+    std::vector<uint8_t> rgba(texW * texH * 4, 0);
+    for (int i = 0; i < texW * texH; ++i) {
+        uint32_t px = dibPixels[i];
+        uint8_t r = static_cast<uint8_t>((px >> 16) & 0xFF);
+        uint8_t g = static_cast<uint8_t>((px >> 8) & 0xFF);
+        uint8_t b = static_cast<uint8_t>(px & 0xFF);
+        uint8_t lum = static_cast<uint8_t>((static_cast<int>(r) + static_cast<int>(g) + static_cast<int>(b)) / 3);
+        rgba[i * 4 + 0] = 255;
+        rgba[i * 4 + 1] = 255;
+        rgba[i * 4 + 2] = 255;
+        rgba[i * 4 + 3] = lum;
+    }
+
+    glGenTextures(1, &g_fontTexId);
+    glBindTexture(GL_TEXTURE_2D, g_fontTexId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texW, texH, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    SelectObject(memDC, oldFont);
+    DeleteObject(hFont);
+    SelectObject(memDC, oldBmp);
+    DeleteObject(hBmp);
+    DeleteDC(memDC);
+}
+
+static void glDrawRect(float x, float y, float w, float h, float r, float g, float b, float a) {
+    glDisable(GL_TEXTURE_2D);
+    glColor4f(r, g, b, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+}
+
+static void glDrawOutlineRect(float x, float y, float w, float h, float lineW, float r, float g, float b, float a) {
+    glDisable(GL_TEXTURE_2D);
+    glLineWidth(lineW);
+    glColor4f(r, g, b, a);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+}
+
+static void glDrawText(float x, float baselineY, const std::string& text, float r = 1.f, float g = 1.f, float b = 1.f, float a = 1.f) {
+    if (text.empty()) return;
+    initFontTextureAtlas();
+    if (g_fontTexId == 0) return;
+
+    float topY = baselineY - 14.5f;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_fontTexId);
+    glColor4f(r, g, b, a);
+
+    float curX = x;
+    glBegin(GL_QUADS);
+    for (unsigned char c : text) {
+        if (c < 32 || c >= 127) continue;
+        const auto& gl = g_glyphs[c];
+        float w = gl.advance + 2.0f;
+        float h = kGlyphCellH;
+
+        glTexCoord2f(gl.u0, gl.v0); glVertex2f(curX,     topY);
+        glTexCoord2f(gl.u1, gl.v0); glVertex2f(curX + w, topY);
+        glTexCoord2f(gl.u1, gl.v1); glVertex2f(curX + w, topY + h);
+        glTexCoord2f(gl.u0, gl.v1); glVertex2f(curX,     topY + h);
+
+        curX += gl.advance;
+    }
+    glEnd();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+}
+
+static void hsvToRgbFloats(float h, float s, float v, float& outR, float& outG, float& outB) {
+    float c = v * s;
+    float x = c * (1.0f - std::abs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float r = 0.f, g = 0.f, b = 0.f;
+    if (h < 60.f)       { r = c; g = x; b = 0.f; }
+    else if (h < 120.f) { r = x; g = c; b = 0.f; }
+    else if (h < 180.f) { r = 0.f; g = c; b = x; }
+    else if (h < 240.f) { r = 0.f; g = x; b = c; }
+    else if (h < 300.f) { r = x; g = 0.f; b = c; }
+    else                { r = c; g = 0.f; b = x; }
+    outR = r + m;
+    outG = g + m;
+    outB = b + m;
+}
+
+static float easeOutBack(float t) {
+    const float c1 = 1.70158f;
+    const float c3 = c1 + 1.0f;
+    return 1.0f + c3 * std::pow(t - 1.0f, 3.0f) + c1 * std::pow(t - 1.0f, 2.0f);
+}
+
+static bool pointInRect(float px, float py, float rx, float ry, float rw, float rh) {
+    return px >= rx && px <= (rx + rw) && py >= ry && py <= (ry + rh);
+}
+
+// ============================================================================
+// 5. COCOS2D-X & GD ENGINE MEMORY CONTROLLERS
 // ============================================================================
 static uint8_t* findPatternInModule(HMODULE mod, const uint8_t* pattern, const char* mask) {
     if (!mod) return nullptr;
@@ -251,30 +475,6 @@ static void patchBytesSafe(void* addr, const uint8_t* bytes, size_t len) {
     if (VirtualProtect(addr, len, PAGE_EXECUTE_READWRITE, &oldProt)) {
         std::memcpy(addr, bytes, len);
         VirtualProtect(addr, len, oldProt, &oldProt);
-    }
-}
-
-static void applyNativeCocosSpeedhack() {
-    HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
-    if (!cocos) return;
-
-    using SharedDirFn = void*(__cdecl*)();
-    using GetSchedFn = void*(__fastcall*)(void*);
-    using SetTimeScaleFn = void(__fastcall*)(void*, float);
-
-    static auto sharedDir = reinterpret_cast<SharedDirFn>(GetProcAddress(cocos, "?sharedDirector@CCDirector@cocos2d@@SAPEAV12@XZ"));
-    static auto getSched  = reinterpret_cast<GetSchedFn>(GetProcAddress(cocos, "?getScheduler@CCDirector@cocos2d@@UEAAPEAVCCScheduler@2@XZ"));
-    static auto setScale  = reinterpret_cast<SetTimeScaleFn>(GetProcAddress(cocos, "?setTimeScale@CCScheduler@cocos2d@@QEAAXM@Z"));
-
-    if (sharedDir && getSched && setScale) {
-        void* dir = sharedDir();
-        if (dir) {
-            void* sched = getSched(dir);
-            if (sched) {
-                float s = g_mh.speedhackEnabled ? g_mh.speedhackValue : 1.0f;
-                setScale(sched, s);
-            }
-        }
     }
 }
 
@@ -349,8 +549,28 @@ static void updateWindowStyleModifiers(HWND hwnd) {
 }
 
 // ============================================================================
-// 4. HIGH-RESOLUTION TIMER HOOK (SPEEDHACK & FRAME STEPPER)
+// 6. MINHOOK ENGINE HOOKS (CCScheduler::update, QPC, WndProc, wglSwapBuffers)
 // ============================================================================
+using CCSchedulerUpdateFn = void(__fastcall*)(void*, float);
+static CCSchedulerUpdateFn g_origSchedulerUpdate = nullptr;
+
+static void __fastcall hookedSchedulerUpdate(void* self, float dt) {
+    if (g_mh.frameStepper && !g_mh.menuOpen) {
+        if (g_mh.stepAdvanceOnce) {
+            g_mh.stepAdvanceOnce = false;
+            dt = 1.0f / 240.0f;
+        } else {
+            return; // Freeze physics step until 'C' is pressed
+        }
+    } else if (g_mh.speedhackEnabled && g_mh.speedhackValue > 0.01f) {
+        dt *= g_mh.speedhackValue;
+    }
+
+    if (g_origSchedulerUpdate) {
+        g_origSchedulerUpdate(self, dt);
+    }
+}
+
 using QPCFn = BOOL(WINAPI*)(LARGE_INTEGER*);
 static QPCFn g_origQPC = QueryPerformanceCounter;
 static LONGLONG g_realBaseTicks = 0;
@@ -379,10 +599,6 @@ static BOOL WINAPI hookedQueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCou
 
     double scale = 1.0;
     if (g_mh.frameStepper && !g_mh.menuOpen) {
-        if (g_mh.stepAdvanceOnce) {
-            g_mh.stepAdvanceOnce = false;
-            g_virtualElapsedTicks += static_cast<double>(g_qpcFreq) / 240.0;
-        }
         scale = 0.0;
     } else if (g_mh.speedhackEnabled && g_mh.speedhackValue > 0.01f) {
         scale = static_cast<double>(g_mh.speedhackValue);
@@ -393,59 +609,14 @@ static BOOL WINAPI hookedQueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCou
     return TRUE;
 }
 
-// ============================================================================
-// 5. WNDPROC INPUT HOOK (BLOCKS CLICKS THROUGH MENU & HANDLES KEYBINDS)
-// ============================================================================
 static WNDPROC g_origWndProc = nullptr;
 static HWND g_hookedHwnd = nullptr;
 
 static LRESULT CALLBACK hookedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_KEYDOWN && (lParam & 0x40000000) == 0) {
-        if (wParam == VK_TAB) {
-            g_mh.menuOpen = !g_mh.menuOpen;
-            if (!g_mh.menuOpen) g_mh.activePopup = 0;
-            return 0;
-        }
-        if (wParam == 'C' && g_mh.frameStepper && !g_mh.menuOpen) {
-            g_mh.stepAdvanceOnce = true;
-            return 0;
-        }
-        if (wParam == 'Q' && g_mh.startPosSwitcher && !g_mh.menuOpen) {
-            g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + g_mh.totalStartPosCount - 1) % g_mh.totalStartPosCount;
-            return 0;
-        }
-        if (wParam == 'E' && g_mh.startPosSwitcher && !g_mh.menuOpen) {
-            g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + 1) % g_mh.totalStartPosCount;
-            return 0;
-        }
-    }
-
-    if (msg == WM_LBUTTONDOWN) {
-        float clickX = static_cast<float>(LOWORD(lParam));
-        float clickY = static_cast<float>(HIWORD(lParam));
-        RECT rc = {};
-        GetClientRect(hwnd, &rc);
-        float vw = static_cast<float>(std::max(1L, rc.right - rc.left));
-
-        // Top-right MHv9 [Tab] Pill Button
-        if (clickX >= (vw - 104.0f) && clickX <= (vw - 12.0f) && clickY >= 10.0f && clickY <= 32.0f) {
-            g_mh.menuOpen = !g_mh.menuOpen;
-            if (!g_mh.menuOpen) g_mh.activePopup = 0;
-            return 0;
-        }
-
-        if (g_mh.menuOpen) {
-            g_mh.uiClickPending = true;
-            g_mh.uiClickX = clickX;
-            g_mh.uiClickY = clickY;
-            return 0; // Block click from reaching Geometry Dash behind the menu
-        }
-    }
-
-    if (g_mh.menuOpen && (msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MOUSEWHEEL)) {
+    // Block mouse clicks from reaching Geometry Dash while Mega Hack v9 menu is open
+    if (g_mh.menuOpen && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MOUSEWHEEL)) {
         return 0;
     }
-
     return CallWindowProcA(g_origWndProc, hwnd, msg, wParam, lParam);
 }
 
@@ -459,85 +630,7 @@ static void ensureWndProcHooked(HWND hwnd) {
 }
 
 // ============================================================================
-// 6. OPENGL IMMEDIATE-MODE RENDERER
-// ============================================================================
-static GLuint g_fontListBase = 0;
-static HDC g_fontDC = nullptr;
-
-static void ensureOpenGLFont(HDC hdc) {
-    if (g_fontListBase != 0 && g_fontDC == hdc) return;
-    g_fontDC = hdc;
-    g_fontListBase = glGenLists(256);
-    HFONT hFont = CreateFontA(
-        -13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY, FF_DONTCARE | DEFAULT_PITCH, "Segoe UI"
-    );
-    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, hFont));
-    wglUseFontBitmapsA(hdc, 0, 255, g_fontListBase);
-    SelectObject(hdc, oldFont);
-    DeleteObject(hFont);
-}
-
-static void glDrawRect(float x, float y, float w, float h, float r, float g, float b, float a) {
-    glColor4f(r, g, b, a);
-    glBegin(GL_QUADS);
-    glVertex2f(x, y);
-    glVertex2f(x + w, y);
-    glVertex2f(x + w, y + h);
-    glVertex2f(x, y + h);
-    glEnd();
-}
-
-static void glDrawOutlineRect(float x, float y, float w, float h, float lineW, float r, float g, float b, float a) {
-    glLineWidth(lineW);
-    glColor4f(r, g, b, a);
-    glBegin(GL_LINE_LOOP);
-    glVertex2f(x, y);
-    glVertex2f(x + w, y);
-    glVertex2f(x + w, y + h);
-    glVertex2f(x, y + h);
-    glEnd();
-}
-
-static void glDrawText(float x, float y, const std::string& text, float r = 1.f, float g = 1.f, float b = 1.f, float a = 1.f) {
-    if (text.empty() || g_fontListBase == 0) return;
-    glColor4f(r, g, b, a);
-    glRasterPos2f(x, y);
-    glPushAttrib(GL_LIST_BIT);
-    glListBase(g_fontListBase);
-    glCallLists(static_cast<GLsizei>(text.size()), GL_UNSIGNED_BYTE, text.c_str());
-    glPopAttrib();
-}
-
-static void hsvToRgbFloats(float h, float s, float v, float& outR, float& outG, float& outB) {
-    float c = v * s;
-    float x = c * (1.0f - std::abs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
-    float m = v - c;
-    float r = 0.f, g = 0.f, b = 0.f;
-    if (h < 60.f)       { r = c; g = x; b = 0.f; }
-    else if (h < 120.f) { r = x; g = c; b = 0.f; }
-    else if (h < 180.f) { r = 0.f; g = c; b = x; }
-    else if (h < 240.f) { r = 0.f; g = x; b = c; }
-    else if (h < 300.f) { r = x; g = 0.f; b = c; }
-    else                { r = c; g = 0.f; b = x; }
-    outR = r + m;
-    outG = g + m;
-    outB = b + m;
-}
-
-static float easeOutBack(float t) {
-    const float c1 = 1.70158f;
-    const float c3 = c1 + 1.0f;
-    return 1.0f + c3 * std::pow(t - 1.0f, 3.0f) + c1 * std::pow(t - 1.0f, 2.0f);
-}
-
-static bool pointInRect(float px, float py, float rx, float ry, float rw, float rh) {
-    return px >= rx && px <= (rx + rw) && py >= ry && py <= (ry + rh);
-}
-
-// ============================================================================
-// 7. MAIN FRAME RENDER & INTERACTION LOOP
+// 7. MAIN FRAME RENDER & INTERACTION LOOP (CALLED INSIDE WGLSWAPBUFFERS)
 // ============================================================================
 static LONGLONG g_lastOverlayTick = 0;
 
@@ -563,7 +656,39 @@ static void renderMegaHackV9Frame(HDC hdc) {
     g_mh.totalFrames++;
     g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * g_mh.rgbSpeed, 360.0f);
 
-    bool jumpHeld = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) ||
+    // Poll Hardware Keys directly (Tab OR Insert to toggle menu)
+    bool tabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+    bool insDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    if ((tabDown && !g_mh.prevTabDown) || (insDown && !g_mh.prevInsertDown)) {
+        g_mh.menuOpen = !g_mh.menuOpen;
+        if (!g_mh.menuOpen) g_mh.activePopup = 0;
+    }
+    g_mh.prevTabDown = tabDown;
+    g_mh.prevInsertDown = insDown;
+
+    bool cDown = (GetAsyncKeyState('C') & 0x8000) != 0;
+    if (cDown && !g_mh.prevCDown && g_mh.frameStepper) {
+        g_mh.stepAdvanceOnce = true;
+    }
+    g_mh.prevCDown = cDown;
+
+    bool qDown = (GetAsyncKeyState('Q') & 0x8000) != 0;
+    if (qDown && !g_mh.prevQDown && g_mh.startPosSwitcher) {
+        g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + g_mh.totalStartPosCount - 1) % g_mh.totalStartPosCount;
+    }
+    g_mh.prevQDown = qDown;
+
+    bool eDown = (GetAsyncKeyState('E') & 0x8000) != 0;
+    if (eDown && !g_mh.prevEDown && g_mh.startPosSwitcher) {
+        g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + 1) % g_mh.totalStartPosCount;
+    }
+    g_mh.prevEDown = eDown;
+
+    bool mouseLeft = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    bool mouseClicked = (mouseLeft && !g_mh.prevMouseLeft);
+    g_mh.prevMouseLeft = mouseLeft;
+
+    bool jumpHeld = mouseLeft ||
                     ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) ||
                     ((GetAsyncKeyState(VK_UP) & 0x8000) != 0) ||
                     ((GetAsyncKeyState('W') & 0x8000) != 0);
@@ -602,7 +727,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
         }
     }
 
-    // Update Menu Animation Progress
+    // Update Smooth Menu Animation Progress
     if (g_mh.animStyle == 3) {
         g_mh.animProgress = g_mh.menuOpen ? 1.0f : 0.0f;
     } else {
@@ -620,14 +745,21 @@ static void renderMegaHackV9Frame(HDC hdc) {
     float mx = static_cast<float>(pt.x);
     float my = static_cast<float>(pt.y);
 
-    bool mouseClicked = g_mh.uiClickPending;
-    if (mouseClicked) {
-        mx = g_mh.uiClickX;
-        my = g_mh.uiClickY;
-        g_mh.uiClickPending = false;
-    }
+    // CRITICAL FIX: Unbind Cocos2d-x GLSL Shader Program & VBOs before drawing 2D overlay!
+    resolveModernGLProcs();
+    GLint prevProgram = 0;
+    GLint prevArrayBuffer = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArrayBuffer);
 
-    ensureOpenGLFont(hdc);
+    if (pglUseProgram)      pglUseProgram(0);
+    if (pglBindVertexArray) pglBindVertexArray(0);
+    if (pglBindBuffer) {
+        pglBindBuffer(GL_ARRAY_BUFFER, 0);
+        pglBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+    if (pglActiveTexture)   pglActiveTexture(GL_TEXTURE0);
+
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glPushMatrix();
     glViewport(0, 0, static_cast<GLsizei>(viewW), static_cast<GLsizei>(viewH));
@@ -640,6 +772,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glLoadIdentity();
 
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_TEXTURE_2D);
     glEnable(GL_BLEND);
@@ -673,6 +806,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
         float relVy = g_mh.simPlayerVelY;
         float curX = playerScreenX;
 
+        glDisable(GL_TEXTURE_2D);
         glLineWidth(2.2f);
         glBegin(GL_LINE_STRIP);
         glColor4f(0.18f, 0.95f, 0.45f, 0.90f);
@@ -707,6 +841,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     if ((g_mh.p1RgbIcons || g_mh.p1RgbTrail || g_mh.solidWaveTrail) && !g_mh.noWaveTrail) {
         float r = 1.f, g = 1.f, b = 1.f;
         hsvToRgbFloats(g_mh.rgbHue, 0.85f, 1.0f, r, g, b);
+        glDisable(GL_TEXTURE_2D);
         glLineWidth(g_mh.noWavePulse ? 2.2f : 3.8f);
         glBegin(GL_LINE_STRIP);
         glColor4f(r, g, b, g_mh.solidWaveTrail ? 1.0f : 0.85f);
@@ -719,7 +854,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     // Status HUD (4-Corner Anchor System)
     float hudX = 16.0f;
     float hudY = 24.0f;
-    if (g_mh.hudAnchor == 1) { hudX = viewW - 185.0f; hudY = 24.0f; }
+    if (g_mh.hudAnchor == 1) { hudX = viewW - 195.0f; hudY = 42.0f; }
     else if (g_mh.hudAnchor == 2) { hudX = 16.0f; hudY = viewH - 125.0f; }
     else if (g_mh.hudAnchor == 3) { hudX = viewW * 0.5f - 80.0f; hudY = 36.0f; }
 
@@ -736,7 +871,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     auto drawHudLine = [&](const std::string& line) {
         glDrawText(hudX + 1.0f, hudY + 1.0f, line, 0.0f, 0.0f, 0.0f, 0.85f);
         glDrawText(hudX, hudY, line, 0.95f, 0.96f, 1.0f, 0.95f);
-        hudY += 16.0f;
+        hudY += 18.0f;
     };
 
     if (g_mh.showFps) {
@@ -779,33 +914,38 @@ static void renderMegaHackV9Frame(HDC hdc) {
     }
 
     if (g_mh.startPosSwitcher) {
-        float barW = 168.0f;
+        float barW = 176.0f;
         float barH = 24.0f;
         float barX = (viewW - barW) * 0.5f;
         float barY = viewH - 34.0f;
         glDrawRect(barX, barY, barW, barH, 0.08f, 0.08f, 0.11f, 0.85f);
         glDrawOutlineRect(barX, barY, barW, barH, 1.2f, 0.85f, 0.16f, 0.16f, 0.92f);
-        std::string spStr = "< [Q]  StartPos " + std::to_string(g_mh.currentStartPosIdx + 1) + "/" + std::to_string(g_mh.totalStartPosCount) + "  [E] >";
-        glDrawText(barX + 12.0f, barY + 16.0f, spStr, 0.95f, 0.88f, 0.55f, 0.95f);
+        std::string spStr = "< [Q] StartPos " + std::to_string(g_mh.currentStartPosIdx + 1) + "/" + std::to_string(g_mh.totalStartPosCount) + " [E] >";
+        glDrawText(barX + 10.0f, barY + 16.0f, spStr, 0.95f, 0.88f, 0.55f, 0.95f);
     }
 
     // Top-Right MHv9 [Tab] Pill Button
-    float pillW = 92.0f;
+    float pillW = 96.0f;
     float pillH = 22.0f;
     float pillX = viewW - pillW - 12.0f;
     float pillY = 10.0f;
     bool hoverPill = pointInRect(mx, my, pillX, pillY, pillW, pillH);
-    glDrawRect(pillX, pillY, pillW, pillH, hoverPill ? 0.90f : 0.78f, 0.15f, 0.15f, 0.92f);
-    glDrawOutlineRect(pillX, pillY, pillW, pillH, 1.2f, 1.0f, 0.35f, 0.35f, 0.95f);
-    glDrawText(pillX + 11.0f, pillY + 15.0f, "MHv9 [Tab]", 1.0f, 1.0f, 1.0f, 1.0f);
+    glDrawRect(pillX, pillY, pillW, pillH, hoverPill ? 0.92f : 0.80f, 0.15f, 0.15f, 0.94f);
+    glDrawOutlineRect(pillX, pillY, pillW, pillH, 1.2f, 1.0f, 0.38f, 0.38f, 0.95f);
+    glDrawText(pillX + 10.0f, pillY + 15.0f, "MHv9 [Tab]", 1.0f, 1.0f, 1.0f, 1.0f);
+    if (mouseClicked && hoverPill) {
+        g_mh.menuOpen = !g_mh.menuOpen;
+        if (!g_mh.menuOpen) g_mh.activePopup = 0;
+        mouseClicked = false;
+    }
 
     // ------------------------------------------------------------------------
     // 6-COLUMN MEGA HACK V9 PRO INTERFACE
     // ------------------------------------------------------------------------
     if (g_mh.animProgress > 0.005f) {
-        glDrawRect(0.0f, 0.0f, viewW, viewH, 0.02f, 0.02f, 0.04f, 0.64f * g_mh.animProgress);
+        glDrawRect(0.0f, 0.0f, viewW, viewH, 0.02f, 0.02f, 0.04f, 0.65f * g_mh.animProgress);
 
-        float colW = std::min(194.0f, (viewW - 56.0f) / 6.0f);
+        float colW = std::min(196.0f, (viewW - 56.0f) / 6.0f);
         float gap = 7.0f;
         float totalW = 6.0f * colW + 5.0f * gap;
         float startX = (viewW - totalW) * 0.5f;
@@ -867,9 +1007,9 @@ static void renderMegaHackV9Frame(HDC hdc) {
             glDrawRect(colX + 3.0f, curY, 20.0f, rowH - 2.0f, minusHov ? 0.82f : 0.22f, 0.18f, 0.22f, 0.90f);
             glDrawRect(colX + colW - 23.0f, curY, 20.0f, rowH - 2.0f, plusHov ? 0.82f : 0.22f, 0.18f, 0.22f, 0.90f);
 
-            glDrawText(colX + 10.0f, curY + 14.0f, "-", 1.0f, 1.0f, 1.0f, 1.0f);
+            glDrawText(colX + 9.0f, curY + 14.0f, "-", 1.0f, 1.0f, 1.0f, 1.0f);
             glDrawText(colX + colW - 17.0f, curY + 14.0f, "+", 1.0f, 1.0f, 1.0f, 1.0f);
-            glDrawText(colX + 27.0f, curY + 14.0f, text, 0.96f, 0.85f, 0.48f, 1.0f);
+            glDrawText(colX + 26.0f, curY + 14.0f, text, 0.96f, 0.85f, 0.48f, 1.0f);
 
             if (mouseClicked && g_mh.menuOpen) {
                 if (minusHov) onStep(-1);
@@ -975,22 +1115,18 @@ static void renderMegaHackV9Frame(HDC hdc) {
             g_mh = MegaHackV9Engine();
             g_mh.menuOpen = true;
             g_mh.animProgress = 1.0f;
-            applyNativeCocosSpeedhack();
             applyNativeFpsAndVsync();
             updateWindowStyleModifiers(hwnd);
         });
 
         // Column 4: Display & Speedhack
         beginColumn(3, "DISPLAY / SPEED", 7, cx, cy);
-        drawToggleFull(cx, cy, "Speedhack", &g_mh.speedhackEnabled, [&]() {
-            applyNativeCocosSpeedhack();
-        }, nullptr);
+        drawToggleSimple(cx, cy, "Speedhack", &g_mh.speedhackEnabled);
         {
             std::ostringstream ss;
             ss << "Speed: " << std::fixed << std::setprecision(2) << g_mh.speedhackValue << "x";
             drawStepperItem(cx, cy, ss.str(), [&](int d) {
                 g_mh.speedhackValue = std::clamp(g_mh.speedhackValue + d * 0.10f, 0.10f, 5.00f);
-                applyNativeCocosSpeedhack();
             });
         }
         drawToggleSimple(cx, cy, "Speedhack Audio", &g_mh.speedhackAudio);
@@ -1045,7 +1181,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
             g_mh.macroMode = 0;
         });
 
-        // Submenu Popup 1: Granular No Particles Filter
+        // Popup 1: Granular No Particles Filter
         if (g_mh.activePopup == 1) {
             float pw = 215.0f;
             float ph = 150.0f;
@@ -1067,7 +1203,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
             colW = savedColW;
         }
 
-        // Submenu Popup 2: Custom Background RGB Picker
+        // Popup 2: Custom Background RGB Picker
         if (g_mh.activePopup == 2) {
             float pw = 215.0f;
             float ph = 128.0f;
@@ -1094,7 +1230,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
             colW = savedColW;
         }
 
-        // Submenu Popup 3: Icon RGB Speed Customizer
+        // Popup 3: Icon RGB Speed Customizer
         if (g_mh.activePopup == 3) {
             float pw = 215.0f;
             float ph = 105.0f;
@@ -1111,7 +1247,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
             drawStepperItem(px, itemY, "RGB Speed: " + std::to_string(static_cast<int>(g_mh.rgbSpeed)), [&](int d) {
                 g_mh.rgbSpeed = std::clamp(g_mh.rgbSpeed + d * 25.0f, 20.0f, 500.0f);
             });
-            drawButtonItem(px, itemY, "Close RGB Customizer", [&]() { g_mh.activePopup = 0; });
+            drawButtonItem(px, itemY, "Close Customizer", [&]() { g_mh.activePopup = 0; });
             colW = savedColW;
         }
     }
@@ -1122,14 +1258,17 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glPopMatrix();
     glPopMatrix();
     glPopAttrib();
+
+    // Restore Cocos2d-x GLSL Shader Program & Array Buffer
+    if (pglUseProgram) pglUseProgram(static_cast<GLuint>(prevProgram));
+    if (pglBindBuffer) pglBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(prevArrayBuffer));
 }
 
 // ============================================================================
-// 8. 64-BIT INLINE TRAMPOLINE + IAT HOOK ENGINE (100% RELIABLE CAPTURE)
+// 8. MINHOOK INITIALIZATION THREAD
 // ============================================================================
 using SwapBuffersFn = BOOL(WINAPI*)(HDC);
 static SwapBuffersFn g_origWglSwapBuffers = nullptr;
-static SwapBuffersFn g_origGdiSwapBuffers = SwapBuffers;
 static bool g_inSwapHook = false;
 
 static BOOL WINAPI hookedWglSwapBuffers(HDC hdc) {
@@ -1138,136 +1277,45 @@ static BOOL WINAPI hookedWglSwapBuffers(HDC hdc) {
         renderMegaHackV9Frame(hdc);
         g_inSwapHook = false;
     }
-    return g_origWglSwapBuffers ? g_origWglSwapBuffers(hdc) : SwapBuffers(hdc);
-}
-
-static BOOL WINAPI hookedGdiSwapBuffers(HDC hdc) {
-    if (!g_inSwapHook && hdc) {
-        g_inSwapHook = true;
-        renderMegaHackV9Frame(hdc);
-        g_inSwapHook = false;
-    }
-    return g_origGdiSwapBuffers(hdc);
-}
-
-static bool installInlineHook64(void* targetFunc, void* detourFunc, void** outTrampoline) {
-    if (!targetFunc || !detourFunc || !outTrampoline) return false;
-    uint8_t* src = static_cast<uint8_t*>(targetFunc);
-
-    // Follow 5-byte relative JMP (0xE9) if Steam Overlay or another hook is already at the entry
-    for (int hop = 0; hop < 3; ++hop) {
-        if (src[0] == 0xE9) {
-            int32_t rel = *reinterpret_cast<int32_t*>(src + 1);
-            src = src + 5 + rel;
-        } else {
-            break;
-        }
-    }
-
-    // Standard x64 prologue for opengl32!wglSwapBuffers / gdi32!SwapBuffers is 15 bytes
-    // Verify safe non-branching prologue bytes before inline patching
-    size_t copyLen = 0;
-    if (src[0] == 0x48 && src[1] == 0x89 && src[2] == 0x5C && src[3] == 0x24 &&
-        src[5] == 0x57 && src[6] == 0x48 && src[7] == 0x83 && src[8] == 0xEC) {
-        copyLen = 15;
-    } else if (src[0] == 0x40 && src[1] == 0x53 && src[2] == 0x48 && src[3] == 0x83 && src[4] == 0xEC) {
-        copyLen = 14;
-    } else if (src[0] == 0x48 && src[1] == 0x8B && src[2] == 0xC4) {
-        copyLen = 14;
-    }
-
-    if (copyLen < 14) return false;
-
-    uint8_t* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!tramp) return false;
-
-    std::memcpy(tramp, src, copyLen);
-    // Append 14-byte absolute jump back to src + copyLen
-    tramp[copyLen + 0] = 0xFF;
-    tramp[copyLen + 1] = 0x25;
-    *reinterpret_cast<uint32_t*>(tramp + copyLen + 2) = 0;
-    *reinterpret_cast<uint64_t*>(tramp + copyLen + 6) = reinterpret_cast<uint64_t>(src + copyLen);
-
-    DWORD oldProt = 0;
-    if (!VirtualProtect(src, copyLen, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-
-    // Write 14-byte absolute jump from src to detourFunc
-    src[0] = 0xFF;
-    src[1] = 0x25;
-    *reinterpret_cast<uint32_t*>(src + 2) = 0;
-    *reinterpret_cast<uint64_t*>(src + 6) = reinterpret_cast<uint64_t>(detourFunc);
-    for (size_t i = 14; i < copyLen; ++i) src[i] = 0x90;
-
-    VirtualProtect(src, copyLen, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), src, copyLen);
-    *outTrampoline = tramp;
-    return true;
-}
-
-static void hookModuleIAT(HMODULE mod, const char* targetFuncName, void* newFunc, void** outOrigFunc) {
-    if (!mod) return;
-    uint8_t* base = reinterpret_cast<uint8_t*>(mod);
-    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-
-    DWORD importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!importRva) return;
-
-    auto importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + importRva);
-    for (; importDesc->Name; ++importDesc) {
-        if (!importDesc->OriginalFirstThunk || !importDesc->FirstThunk) continue;
-        auto origThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->OriginalFirstThunk);
-        auto iatThunk  = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->FirstThunk);
-
-        for (; origThunk->u1.AddressOfData; ++origThunk, ++iatThunk) {
-            if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
-            auto importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + origThunk->u1.AddressOfData);
-            if (std::strcmp(reinterpret_cast<const char*>(importByName->Name), targetFuncName) == 0) {
-                DWORD oldProt = 0;
-                if (VirtualProtect(&iatThunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) {
-                    if (outOrigFunc && *outOrigFunc == nullptr) {
-                        *outOrigFunc = reinterpret_cast<void*>(iatThunk->u1.Function);
-                    }
-                    iatThunk->u1.Function = reinterpret_cast<ULONG_PTR>(newFunc);
-                    VirtualProtect(&iatThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
-                }
-            }
-        }
-    }
+    return g_origWglSwapBuffers ? g_origWglSwapBuffers(hdc) : FALSE;
 }
 
 static DWORD WINAPI megaHackInitThread(LPVOID) {
-    for (int retry = 0; retry < 120; ++retry) {
+    for (int retry = 0; retry < 150; ++retry) {
         if (GetModuleHandleA("libcocos2d.dll") && GetModuleHandleA("opengl32.dll")) break;
         Sleep(50);
     }
-    Sleep(250);
+    Sleep(200);
 
-    HMODULE ogl = GetModuleHandleA("opengl32.dll");
-    if (ogl) {
-        void* wglSwapAddr = reinterpret_cast<void*>(GetProcAddress(ogl, "wglSwapBuffers"));
-        if (wglSwapAddr) {
-            g_origWglSwapBuffers = reinterpret_cast<SwapBuffersFn>(wglSwapAddr);
-            installInlineHook64(wglSwapAddr, reinterpret_cast<void*>(&hookedWglSwapBuffers), reinterpret_cast<void**>(&g_origWglSwapBuffers));
+    if (MH_Initialize() == MH_OK) {
+        // 1. Hook opengl32!wglSwapBuffers (Universal OpenGL Frame Present)
+        HMODULE ogl = GetModuleHandleA("opengl32.dll");
+        if (ogl) {
+            void* wglSwap = reinterpret_cast<void*>(GetProcAddress(ogl, "wglSwapBuffers"));
+            if (wglSwap) {
+                MH_CreateHook(wglSwap, reinterpret_cast<void*>(&hookedWglSwapBuffers), reinterpret_cast<void**>(&g_origWglSwapBuffers));
+            }
         }
-    }
 
-    HMODULE mods[6] = {
-        GetModuleHandleA(nullptr),
-        GetModuleHandleA("libcocos2d.dll"),
-        GetModuleHandleA("opengl32.dll"),
-        GetModuleHandleA("Geode.dll"),
-        GetModuleHandleA("glew32.dll"),
-        GetModuleHandleA("gdi32.dll")
-    };
+        // 2. Hook libcocos2d!CCScheduler::update (Real Physics Speedhack & Frame Stepper)
+        HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
+        if (cocos) {
+            void* schedUpdate = reinterpret_cast<void*>(GetProcAddress(cocos, "?update@CCScheduler@cocos2d@@UEAAXM@Z"));
+            if (schedUpdate) {
+                MH_CreateHook(schedUpdate, reinterpret_cast<void*>(&hookedSchedulerUpdate), reinterpret_cast<void**>(&g_origSchedulerUpdate));
+            }
+        }
 
-    for (HMODULE m : mods) {
-        if (!m) continue;
-        hookModuleIAT(m, "SwapBuffers", reinterpret_cast<void*>(&hookedGdiSwapBuffers), nullptr);
-        hookModuleIAT(m, "wglSwapBuffers", reinterpret_cast<void*>(&hookedWglSwapBuffers), nullptr);
-        hookModuleIAT(m, "QueryPerformanceCounter", reinterpret_cast<void*>(&hookedQueryPerformanceCounter), nullptr);
+        // 3. Hook QueryPerformanceCounter
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        if (k32) {
+            void* qpcAddr = reinterpret_cast<void*>(GetProcAddress(k32, "QueryPerformanceCounter"));
+            if (qpcAddr) {
+                MH_CreateHook(qpcAddr, reinterpret_cast<void*>(&hookedQueryPerformanceCounter), reinterpret_cast<void**>(&g_origQPC));
+            }
+        }
+
+        MH_EnableHook(MH_ALL_HOOKS);
     }
 
     return 0;
@@ -1276,7 +1324,6 @@ static DWORD WINAPI megaHackInitThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        // Pin DLL in memory so Geode never unloads the background hook thread
         HMODULE pinned = nullptr;
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
