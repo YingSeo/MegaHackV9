@@ -4,14 +4,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(MegaHackV9 VERSION 9.1.0)
+project(MegaHackV9 VERSION 9.5.0)
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp
 )
 
 if (NOT DEFINED ENV{GEODE_SDK})
-    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable")
+    message(FATAL_ERROR "Unable to find Geode SDK!")
 endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
