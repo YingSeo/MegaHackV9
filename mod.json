@@ -1,0 +1,16 @@
+{
+    "geode": "4.4.0",
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081",
+        "mac": "2.2081",
+        "ios": "2.2081"
+    },
+    "id": "absolute.megahack_v9",
+    "name": "Mega Hack v9 Pro",
+    "version": "v9.1.0",
+    "developer": "Absolute",
+    "description": "Full-featured Mega Hack v9 + QOLMod Engine for Geometry Dash 2.2081. Press TAB to toggle.",
+    "tags": ["gameplay", "interface", "utility", "enhancement", "cheats"],
+    "early-load": true
+}
