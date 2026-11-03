@@ -9,7 +9,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Build & Package Valid .geode File
+      - name: Build Geode Mod
         uses: geode-sdk/build-geode-mod@main
         with:
           combine-files: true
