@@ -1,0 +1,16 @@
+name: Build Mega Hack v9 Pro
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build & Package Valid .geode File
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          combine-files: true
+          upload-artifact: true
