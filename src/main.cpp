@@ -1,10 +1,8 @@
-#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
 #include <psapi.h>
 #include <GL/gl.h>
-#include "MinHook.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -21,10 +19,61 @@
 #include <fstream>
 
 // ============================================================================
-// 1. GEODE IMPLICIT LOAD EXPORT
+// 1. PROXY EXPORTS CHO XINPUT9_1_0.DLL, XINPUT1_4.DLL & GEODE LOADER
 // ============================================================================
-extern "C" __declspec(dllexport) void geode_implicit_load(void* modPtr) {
-    (void)modPtr;
+static HMODULE g_origXInput = nullptr;
+
+static void initXInputProxy() {
+    if (g_origXInput) return;
+    char sysDir[MAX_PATH] = {0};
+    GetSystemDirectoryA(sysDir, MAX_PATH);
+    std::string p910 = std::string(sysDir) + "\\XInput9_1_0.dll";
+    g_origXInput = LoadLibraryA(p910.c_str());
+    if (!g_origXInput) {
+        std::string p14 = std::string(sysDir) + "\\xinput1_4.dll";
+        g_origXInput = LoadLibraryA(p14.c_str());
+    }
+}
+
+extern "C" {
+    __declspec(dllexport) void geode_implicit_load(void* modPtr) {
+        (void)modPtr;
+    }
+
+    __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD dwUserIndex, void* pState) {
+        initXInputProxy();
+        using Fn = DWORD(WINAPI*)(DWORD, void*);
+        static Fn fn = g_origXInput ? reinterpret_cast<Fn>(GetProcAddress(g_origXInput, "XInputGetState")) : nullptr;
+        return fn ? fn(dwUserIndex, pState) : ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    __declspec(dllexport) DWORD WINAPI XInputSetState(DWORD dwUserIndex, void* pVibration) {
+        initXInputProxy();
+        using Fn = DWORD(WINAPI*)(DWORD, void*);
+        static Fn fn = g_origXInput ? reinterpret_cast<Fn>(GetProcAddress(g_origXInput, "XInputSetState")) : nullptr;
+        return fn ? fn(dwUserIndex, pVibration) : ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    __declspec(dllexport) DWORD WINAPI XInputGetCapabilities(DWORD dwUserIndex, DWORD dwFlags, void* pCapabilities) {
+        initXInputProxy();
+        using Fn = DWORD(WINAPI*)(DWORD, DWORD, void*);
+        static Fn fn = g_origXInput ? reinterpret_cast<Fn>(GetProcAddress(g_origXInput, "XInputGetCapabilities")) : nullptr;
+        return fn ? fn(dwUserIndex, dwFlags, pCapabilities) : ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    __declspec(dllexport) void WINAPI XInputEnable(BOOL enable) {
+        initXInputProxy();
+        using Fn = void(WINAPI*)(BOOL);
+        static Fn fn = g_origXInput ? reinterpret_cast<Fn>(GetProcAddress(g_origXInput, "XInputEnable")) : nullptr;
+        if (fn) fn(enable);
+    }
+
+    __declspec(dllexport) DWORD WINAPI XInputGetDSoundAudioDeviceGuids(DWORD dwUserIndex, GUID* pDSoundRenderGuid, GUID* pDSoundCaptureGuid) {
+        initXInputProxy();
+        using Fn = DWORD(WINAPI*)(DWORD, GUID*, GUID*);
+        static Fn fn = g_origXInput ? reinterpret_cast<Fn>(GetProcAddress(g_origXInput, "XInputGetDSoundAudioDeviceGuids")) : nullptr;
+        return fn ? fn(dwUserIndex, pDSoundRenderGuid, pDSoundCaptureGuid) : ERROR_DEVICE_NOT_CONNECTED;
+    }
 }
 
 // ============================================================================
@@ -148,7 +197,9 @@ struct MegaHackV9Engine {
     float simPlayerY = 260.0f;
     float simPlayerVelY = 0.0f;
 
-    // Input Tracking
+    bool uiClickPending = false;
+    float uiClickX = 0.0f;
+    float uiClickY = 0.0f;
     bool prevTabDown = false;
     bool prevInsertDown = false;
     bool prevMouseLeft = false;
@@ -223,7 +274,7 @@ struct MegaHackV9Engine {
 static MegaHackV9Engine g_mh;
 
 // ============================================================================
-// 3. OPENGL 2.0+ STATE UNBINDER (FIXES BLANK MENU UNDER COCOS2D-X SHADERS)
+// 3. OPENGL 2.0+ SHADER UNBINDER (FIXES BLANK MENU UNDER COCOS2D-X SHADERS)
 // ============================================================================
 #ifndef GL_CURRENT_PROGRAM
 #define GL_CURRENT_PROGRAM 0x8B8D
@@ -289,7 +340,7 @@ static void initFontTextureAtlas() {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = texW;
-    bmi.bmiHeader.biHeight = -texH; // Top-down DIB
+    bmi.bmiHeader.biHeight = -texH;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -336,7 +387,6 @@ static void initFontTextureAtlas() {
         g_glyphs[ch].advance = adv;
     }
 
-    // Convert RGB luminance to RGBA white with smooth alpha channel
     std::vector<uint8_t> rgba(texW * texH * 4, 0);
     for (int i = 0; i < texW * texH; ++i) {
         uint32_t px = dibPixels[i];
@@ -445,7 +495,7 @@ static bool pointInRect(float px, float py, float rx, float ry, float rw, float 
 }
 
 // ============================================================================
-// 5. COCOS2D-X & GD ENGINE MEMORY CONTROLLERS
+// 5. NATIVE COCOS2D-X & GD ENGINE MEMORY CONTROLLERS
 // ============================================================================
 static uint8_t* findPatternInModule(HMODULE mod, const uint8_t* pattern, const char* mask) {
     if (!mod) return nullptr;
@@ -475,6 +525,36 @@ static void patchBytesSafe(void* addr, const uint8_t* bytes, size_t len) {
     if (VirtualProtect(addr, len, PAGE_EXECUTE_READWRITE, &oldProt)) {
         std::memcpy(addr, bytes, len);
         VirtualProtect(addr, len, oldProt, &oldProt);
+    }
+}
+
+static void applyNativeCocosSpeedhack() {
+    HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
+    if (!cocos) return;
+
+    using SharedDirFn = void*(__cdecl*)();
+    using GetSchedFn = void*(__fastcall*)(void*);
+    using SetTimeScaleFn = void(__fastcall*)(void*, float);
+
+    static auto sharedDir = reinterpret_cast<SharedDirFn>(GetProcAddress(cocos, "?sharedDirector@CCDirector@cocos2d@@SAPEAV12@XZ"));
+    static auto getSched  = reinterpret_cast<GetSchedFn>(GetProcAddress(cocos, "?getScheduler@CCDirector@cocos2d@@UEAAPEAVCCScheduler@2@XZ"));
+    static auto setScale  = reinterpret_cast<SetTimeScaleFn>(GetProcAddress(cocos, "?setTimeScale@CCScheduler@cocos2d@@QEAAXM@Z"));
+
+    if (sharedDir && getSched && setScale) {
+        void* dir = sharedDir();
+        if (dir) {
+            void* sched = getSched(dir);
+            if (sched) {
+                float s = 1.0f;
+                if (g_mh.frameStepper && !g_mh.menuOpen) {
+                    s = g_mh.stepAdvanceOnce ? 1.0f : 0.0f;
+                    g_mh.stepAdvanceOnce = false;
+                } else if (g_mh.speedhackEnabled) {
+                    s = g_mh.speedhackValue;
+                }
+                setScale(sched, s);
+            }
+        }
     }
 }
 
@@ -549,28 +629,8 @@ static void updateWindowStyleModifiers(HWND hwnd) {
 }
 
 // ============================================================================
-// 6. MINHOOK ENGINE HOOKS (CCScheduler::update, QPC, WndProc, wglSwapBuffers)
+// 6. HIGH-RESOLUTION TIMER & WNDPROC INPUT HOOKS
 // ============================================================================
-using CCSchedulerUpdateFn = void(__fastcall*)(void*, float);
-static CCSchedulerUpdateFn g_origSchedulerUpdate = nullptr;
-
-static void __fastcall hookedSchedulerUpdate(void* self, float dt) {
-    if (g_mh.frameStepper && !g_mh.menuOpen) {
-        if (g_mh.stepAdvanceOnce) {
-            g_mh.stepAdvanceOnce = false;
-            dt = 1.0f / 240.0f;
-        } else {
-            return; // Freeze physics step until 'C' is pressed
-        }
-    } else if (g_mh.speedhackEnabled && g_mh.speedhackValue > 0.01f) {
-        dt *= g_mh.speedhackValue;
-    }
-
-    if (g_origSchedulerUpdate) {
-        g_origSchedulerUpdate(self, dt);
-    }
-}
-
 using QPCFn = BOOL(WINAPI*)(LARGE_INTEGER*);
 static QPCFn g_origQPC = QueryPerformanceCounter;
 static LONGLONG g_realBaseTicks = 0;
@@ -613,10 +673,52 @@ static WNDPROC g_origWndProc = nullptr;
 static HWND g_hookedHwnd = nullptr;
 
 static LRESULT CALLBACK hookedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Block mouse clicks from reaching Geometry Dash while Mega Hack v9 menu is open
-    if (g_mh.menuOpen && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MOUSEWHEEL)) {
+    if (msg == WM_KEYDOWN && (lParam & 0x40000000) == 0) {
+        if (wParam == VK_TAB || wParam == VK_INSERT) {
+            g_mh.menuOpen = !g_mh.menuOpen;
+            if (!g_mh.menuOpen) g_mh.activePopup = 0;
+            return 0;
+        }
+        if (wParam == 'C' && g_mh.frameStepper && !g_mh.menuOpen) {
+            g_mh.stepAdvanceOnce = true;
+            applyNativeCocosSpeedhack();
+            return 0;
+        }
+        if (wParam == 'Q' && g_mh.startPosSwitcher && !g_mh.menuOpen) {
+            g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + g_mh.totalStartPosCount - 1) % g_mh.totalStartPosCount;
+            return 0;
+        }
+        if (wParam == 'E' && g_mh.startPosSwitcher && !g_mh.menuOpen) {
+            g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + 1) % g_mh.totalStartPosCount;
+            return 0;
+        }
+    }
+
+    if (msg == WM_LBUTTONDOWN) {
+        float clickX = static_cast<float>(LOWORD(lParam));
+        float clickY = static_cast<float>(HIWORD(lParam));
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        float vw = static_cast<float>(std::max(1L, rc.right - rc.left));
+
+        if (clickX >= (vw - 108.0f) && clickX <= (vw - 12.0f) && clickY >= 10.0f && clickY <= 32.0f) {
+            g_mh.menuOpen = !g_mh.menuOpen;
+            if (!g_mh.menuOpen) g_mh.activePopup = 0;
+            return 0;
+        }
+
+        if (g_mh.menuOpen) {
+            g_mh.uiClickPending = true;
+            g_mh.uiClickX = clickX;
+            g_mh.uiClickY = clickY;
+            return 0;
+        }
+    }
+
+    if (g_mh.menuOpen && (msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MOUSEWHEEL)) {
         return 0;
     }
+
     return CallWindowProcA(g_origWndProc, hwnd, msg, wParam, lParam);
 }
 
@@ -630,7 +732,7 @@ static void ensureWndProcHooked(HWND hwnd) {
 }
 
 // ============================================================================
-// 7. MAIN FRAME RENDER & INTERACTION LOOP (CALLED INSIDE WGLSWAPBUFFERS)
+// 7. MAIN FRAME RENDER & INTERACTION LOOP
 // ============================================================================
 static LONGLONG g_lastOverlayTick = 0;
 
@@ -638,6 +740,10 @@ static void renderMegaHackV9Frame(HDC hdc) {
     HWND hwnd = WindowFromDC(hdc);
     if (!hwnd) return;
     ensureWndProcHooked(hwnd);
+
+    if (g_mh.frameStepper) {
+        applyNativeCocosSpeedhack();
+    }
 
     RECT rc = {};
     if (!GetClientRect(hwnd, &rc)) return;
@@ -656,39 +762,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     g_mh.totalFrames++;
     g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * g_mh.rgbSpeed, 360.0f);
 
-    // Poll Hardware Keys directly (Tab OR Insert to toggle menu)
-    bool tabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
-    bool insDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-    if ((tabDown && !g_mh.prevTabDown) || (insDown && !g_mh.prevInsertDown)) {
-        g_mh.menuOpen = !g_mh.menuOpen;
-        if (!g_mh.menuOpen) g_mh.activePopup = 0;
-    }
-    g_mh.prevTabDown = tabDown;
-    g_mh.prevInsertDown = insDown;
-
-    bool cDown = (GetAsyncKeyState('C') & 0x8000) != 0;
-    if (cDown && !g_mh.prevCDown && g_mh.frameStepper) {
-        g_mh.stepAdvanceOnce = true;
-    }
-    g_mh.prevCDown = cDown;
-
-    bool qDown = (GetAsyncKeyState('Q') & 0x8000) != 0;
-    if (qDown && !g_mh.prevQDown && g_mh.startPosSwitcher) {
-        g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + g_mh.totalStartPosCount - 1) % g_mh.totalStartPosCount;
-    }
-    g_mh.prevQDown = qDown;
-
-    bool eDown = (GetAsyncKeyState('E') & 0x8000) != 0;
-    if (eDown && !g_mh.prevEDown && g_mh.startPosSwitcher) {
-        g_mh.currentStartPosIdx = (g_mh.currentStartPosIdx + 1) % g_mh.totalStartPosCount;
-    }
-    g_mh.prevEDown = eDown;
-
-    bool mouseLeft = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    bool mouseClicked = (mouseLeft && !g_mh.prevMouseLeft);
-    g_mh.prevMouseLeft = mouseLeft;
-
-    bool jumpHeld = mouseLeft ||
+    bool jumpHeld = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) ||
                     ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) ||
                     ((GetAsyncKeyState(VK_UP) & 0x8000) != 0) ||
                     ((GetAsyncKeyState('W') & 0x8000) != 0);
@@ -727,7 +801,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         }
     }
 
-    // Update Smooth Menu Animation Progress
     if (g_mh.animStyle == 3) {
         g_mh.animProgress = g_mh.menuOpen ? 1.0f : 0.0f;
     } else {
@@ -745,7 +818,14 @@ static void renderMegaHackV9Frame(HDC hdc) {
     float mx = static_cast<float>(pt.x);
     float my = static_cast<float>(pt.y);
 
-    // CRITICAL FIX: Unbind Cocos2d-x GLSL Shader Program & VBOs before drawing 2D overlay!
+    bool mouseClicked = g_mh.uiClickPending;
+    if (mouseClicked) {
+        mx = g_mh.uiClickX;
+        my = g_mh.uiClickY;
+        g_mh.uiClickPending = false;
+    }
+
+    // Unbind Cocos2d-x GLSL Shader Program & VBOs before drawing 2D overlay
     resolveModernGLProcs();
     GLint prevProgram = 0;
     GLint prevArrayBuffer = 0;
@@ -778,12 +858,10 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Custom Background Ambient Tint Overlay
     if (g_mh.customBackground) {
         glDrawRect(0.0f, 0.0f, viewW, viewH, g_mh.customBgR, g_mh.customBgG, g_mh.customBgB, 0.24f);
     }
 
-    // In-Game Trajectory, Hitboxes & RGB Wave Trail Overlay
     float accelY = jumpHeld ? -680.0f : 620.0f;
     g_mh.simPlayerVelY = std::clamp(g_mh.simPlayerVelY + accelY * dt, -380.0f, 380.0f);
     g_mh.simPlayerY = std::clamp(g_mh.simPlayerY + g_mh.simPlayerVelY * dt, viewH * 0.22f, viewH * 0.78f);
@@ -851,7 +929,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         glEnd();
     }
 
-    // Status HUD (4-Corner Anchor System)
     float hudX = 16.0f;
     float hudY = 24.0f;
     if (g_mh.hudAnchor == 1) { hudX = viewW - 195.0f; hudY = 42.0f; }
@@ -924,7 +1001,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         glDrawText(barX + 10.0f, barY + 16.0f, spStr, 0.95f, 0.88f, 0.55f, 0.95f);
     }
 
-    // Top-Right MHv9 [Tab] Pill Button
     float pillW = 96.0f;
     float pillH = 22.0f;
     float pillX = viewW - pillW - 12.0f;
@@ -933,15 +1009,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glDrawRect(pillX, pillY, pillW, pillH, hoverPill ? 0.92f : 0.80f, 0.15f, 0.15f, 0.94f);
     glDrawOutlineRect(pillX, pillY, pillW, pillH, 1.2f, 1.0f, 0.38f, 0.38f, 0.95f);
     glDrawText(pillX + 10.0f, pillY + 15.0f, "MHv9 [Tab]", 1.0f, 1.0f, 1.0f, 1.0f);
-    if (mouseClicked && hoverPill) {
-        g_mh.menuOpen = !g_mh.menuOpen;
-        if (!g_mh.menuOpen) g_mh.activePopup = 0;
-        mouseClicked = false;
-    }
 
-    // ------------------------------------------------------------------------
-    // 6-COLUMN MEGA HACK V9 PRO INTERFACE
-    // ------------------------------------------------------------------------
     if (g_mh.animProgress > 0.005f) {
         glDrawRect(0.0f, 0.0f, viewW, viewH, 0.02f, 0.02f, 0.04f, 0.65f * g_mh.animProgress);
 
@@ -1115,18 +1183,22 @@ static void renderMegaHackV9Frame(HDC hdc) {
             g_mh = MegaHackV9Engine();
             g_mh.menuOpen = true;
             g_mh.animProgress = 1.0f;
+            applyNativeCocosSpeedhack();
             applyNativeFpsAndVsync();
             updateWindowStyleModifiers(hwnd);
         });
 
         // Column 4: Display & Speedhack
         beginColumn(3, "DISPLAY / SPEED", 7, cx, cy);
-        drawToggleSimple(cx, cy, "Speedhack", &g_mh.speedhackEnabled);
+        drawToggleFull(cx, cy, "Speedhack", &g_mh.speedhackEnabled, [&]() {
+            applyNativeCocosSpeedhack();
+        }, nullptr);
         {
             std::ostringstream ss;
             ss << "Speed: " << std::fixed << std::setprecision(2) << g_mh.speedhackValue << "x";
             drawStepperItem(cx, cy, ss.str(), [&](int d) {
                 g_mh.speedhackValue = std::clamp(g_mh.speedhackValue + d * 0.10f, 0.10f, 5.00f);
+                applyNativeCocosSpeedhack();
             });
         }
         drawToggleSimple(cx, cy, "Speedhack Audio", &g_mh.speedhackAudio);
@@ -1181,7 +1253,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
             g_mh.macroMode = 0;
         });
 
-        // Popup 1: Granular No Particles Filter
         if (g_mh.activePopup == 1) {
             float pw = 215.0f;
             float ph = 150.0f;
@@ -1203,7 +1274,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
             colW = savedColW;
         }
 
-        // Popup 2: Custom Background RGB Picker
         if (g_mh.activePopup == 2) {
             float pw = 215.0f;
             float ph = 128.0f;
@@ -1230,7 +1300,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
             colW = savedColW;
         }
 
-        // Popup 3: Icon RGB Speed Customizer
         if (g_mh.activePopup == 3) {
             float pw = 215.0f;
             float ph = 105.0f;
@@ -1259,16 +1328,16 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glPopMatrix();
     glPopAttrib();
 
-    // Restore Cocos2d-x GLSL Shader Program & Array Buffer
     if (pglUseProgram) pglUseProgram(static_cast<GLuint>(prevProgram));
     if (pglBindBuffer) pglBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(prevArrayBuffer));
 }
 
 // ============================================================================
-// 8. MINHOOK INITIALIZATION THREAD
+// 8. 64-BIT INLINE TRAMPOLINE + IAT HOOK ENGINE (ZERO EXTERNAL LIBS)
 // ============================================================================
 using SwapBuffersFn = BOOL(WINAPI*)(HDC);
 static SwapBuffersFn g_origWglSwapBuffers = nullptr;
+static SwapBuffersFn g_origGdiSwapBuffers = SwapBuffers;
 static bool g_inSwapHook = false;
 
 static BOOL WINAPI hookedWglSwapBuffers(HDC hdc) {
@@ -1277,45 +1346,155 @@ static BOOL WINAPI hookedWglSwapBuffers(HDC hdc) {
         renderMegaHackV9Frame(hdc);
         g_inSwapHook = false;
     }
-    return g_origWglSwapBuffers ? g_origWglSwapBuffers(hdc) : FALSE;
+    return g_origWglSwapBuffers ? g_origWglSwapBuffers(hdc) : SwapBuffers(hdc);
+}
+
+static BOOL WINAPI hookedGdiSwapBuffers(HDC hdc) {
+    if (!g_inSwapHook && hdc) {
+        g_inSwapHook = true;
+        renderMegaHackV9Frame(hdc);
+        g_inSwapHook = false;
+    }
+    return g_origGdiSwapBuffers(hdc);
+}
+
+static bool installInlineHook64(void* targetFunc, void* detourFunc, void** outTrampoline) {
+    if (!targetFunc || !detourFunc || !outTrampoline) return false;
+    uint8_t* src = static_cast<uint8_t*>(targetFunc);
+
+    for (int hop = 0; hop < 3; ++hop) {
+        if (src[0] == 0xE9) {
+            int32_t rel = *reinterpret_cast<int32_t*>(src + 1);
+            src = src + 5 + rel;
+        } else {
+            break;
+        }
+    }
+
+    size_t copyLen = 0;
+    if (src[0] == 0x48 && src[1] == 0x89 && src[2] == 0x5C && src[3] == 0x24 &&
+        src[5] == 0x57 && src[6] == 0x48 && src[7] == 0x83 && src[8] == 0xEC) {
+        copyLen = 15;
+    } else if (src[0] == 0x40 && src[1] == 0x53 && src[2] == 0x48 && src[3] == 0x83 && src[4] == 0xEC) {
+        copyLen = 14;
+    } else if (src[0] == 0x48 && src[1] == 0x8B && src[2] == 0xC4) {
+        copyLen = 14;
+    }
+
+    if (copyLen < 14) return false;
+
+    uint8_t* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return false;
+
+    std::memcpy(tramp, src, copyLen);
+    tramp[copyLen + 0] = 0xFF;
+    tramp[copyLen + 1] = 0x25;
+    *reinterpret_cast<uint32_t*>(tramp + copyLen + 2) = 0;
+    *reinterpret_cast<uint64_t*>(tramp + copyLen + 6) = reinterpret_cast<uint64_t>(src + copyLen);
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(src, copyLen, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+
+    src[0] = 0xFF;
+    src[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(src + 2) = 0;
+    *reinterpret_cast<uint64_t*>(src + 6) = reinterpret_cast<uint64_t>(detourFunc);
+    for (size_t i = 14; i < copyLen; ++i) src[i] = 0x90;
+
+    VirtualProtect(src, copyLen, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), src, copyLen);
+    *outTrampoline = tramp;
+    return true;
+}
+
+static void hookModuleIAT(HMODULE mod, const char* targetFuncName, void* newFunc, void** outOrigFunc) {
+    if (!mod) return;
+    uint8_t* base = reinterpret_cast<uint8_t*>(mod);
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    DWORD importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!importRva) return;
+
+    auto importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + importRva);
+    for (; importDesc->Name; ++importDesc) {
+        if (!importDesc->OriginalFirstThunk || !importDesc->FirstThunk) continue;
+        auto origThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->OriginalFirstThunk);
+        auto iatThunk  = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->FirstThunk);
+
+        for (; origThunk->u1.AddressOfData; ++origThunk, ++iatThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
+            auto importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + origThunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(importByName->Name), targetFuncName) == 0) {
+                DWORD oldProt = 0;
+                if (VirtualProtect(&iatThunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+                    if (outOrigFunc && *outOrigFunc == nullptr) {
+                        *outOrigFunc = reinterpret_cast<void*>(iatThunk->u1.Function);
+                    }
+                    iatThunk->u1.Function = reinterpret_cast<ULONG_PTR>(newFunc);
+                    VirtualProtect(&iatThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
+                }
+            }
+        }
+    }
+}
+
+static BOOL CALLBACK enumWindowsToHookProc(HWND hwnd, LPARAM) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+        ensureWndProcHooked(hwnd);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static DWORD WINAPI megaHackInitThread(LPVOID) {
-    for (int retry = 0; retry < 150; ++retry) {
+    // Prevent double-loading if both XInput9_1_0.dll and .geode are installed
+    HANDLE hMutex = CreateMutexA(nullptr, FALSE, "Local\\MegaHackV9Pro_SingleInstance_Mutex");
+    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        return 0;
+    }
+
+    for (int retry = 0; retry < 120; ++retry) {
         if (GetModuleHandleA("libcocos2d.dll") && GetModuleHandleA("opengl32.dll")) break;
         Sleep(50);
     }
     Sleep(200);
 
-    if (MH_Initialize() == MH_OK) {
-        // 1. Hook opengl32!wglSwapBuffers (Universal OpenGL Frame Present)
-        HMODULE ogl = GetModuleHandleA("opengl32.dll");
-        if (ogl) {
-            void* wglSwap = reinterpret_cast<void*>(GetProcAddress(ogl, "wglSwapBuffers"));
-            if (wglSwap) {
-                MH_CreateHook(wglSwap, reinterpret_cast<void*>(&hookedWglSwapBuffers), reinterpret_cast<void**>(&g_origWglSwapBuffers));
-            }
-        }
+    EnumWindows(enumWindowsToHookProc, 0);
 
-        // 2. Hook libcocos2d!CCScheduler::update (Real Physics Speedhack & Frame Stepper)
-        HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
-        if (cocos) {
-            void* schedUpdate = reinterpret_cast<void*>(GetProcAddress(cocos, "?update@CCScheduler@cocos2d@@UEAAXM@Z"));
-            if (schedUpdate) {
-                MH_CreateHook(schedUpdate, reinterpret_cast<void*>(&hookedSchedulerUpdate), reinterpret_cast<void**>(&g_origSchedulerUpdate));
-            }
+    HMODULE ogl = GetModuleHandleA("opengl32.dll");
+    if (ogl) {
+        void* wglSwapAddr = reinterpret_cast<void*>(GetProcAddress(ogl, "wglSwapBuffers"));
+        if (wglSwapAddr) {
+            g_origWglSwapBuffers = reinterpret_cast<SwapBuffersFn>(wglSwapAddr);
+            installInlineHook64(wglSwapAddr, reinterpret_cast<void*>(&hookedWglSwapBuffers), reinterpret_cast<void**>(&g_origWglSwapBuffers));
         }
+    }
 
-        // 3. Hook QueryPerformanceCounter
-        HMODULE k32 = GetModuleHandleA("kernel32.dll");
-        if (k32) {
-            void* qpcAddr = reinterpret_cast<void*>(GetProcAddress(k32, "QueryPerformanceCounter"));
-            if (qpcAddr) {
-                MH_CreateHook(qpcAddr, reinterpret_cast<void*>(&hookedQueryPerformanceCounter), reinterpret_cast<void**>(&g_origQPC));
-            }
-        }
+    HMODULE mods[6] = {
+        GetModuleHandleA(nullptr),
+        GetModuleHandleA("libcocos2d.dll"),
+        GetModuleHandleA("opengl32.dll"),
+        GetModuleHandleA("Geode.dll"),
+        GetModuleHandleA("glew32.dll"),
+        GetModuleHandleA("gdi32.dll")
+    };
 
-        MH_EnableHook(MH_ALL_HOOKS);
+    for (HMODULE m : mods) {
+        if (!m) continue;
+        hookModuleIAT(m, "SwapBuffers", reinterpret_cast<void*>(&hookedGdiSwapBuffers), nullptr);
+        hookModuleIAT(m, "wglSwapBuffers", reinterpret_cast<void*>(&hookedWglSwapBuffers), nullptr);
+        hookModuleIAT(m, "QueryPerformanceCounter", reinterpret_cast<void*>(&hookedQueryPerformanceCounter), nullptr);
+    }
+
+    // Keep checking for main window creation so WndProc is always hooked for Tab key
+    for (int i = 0; i < 60 && !g_hookedHwnd; ++i) {
+        EnumWindows(enumWindowsToHookProc, 0);
+        Sleep(250);
     }
 
     return 0;
