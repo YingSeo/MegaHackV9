@@ -1,4 +1,3 @@
-#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
@@ -15,10 +14,11 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <functional>
 #include <fstream>
 
 // ============================================================================
-// 1. XINPUT PROXY FORWARDER (CHO PHÉP CHẠY TRỰC TIẾP QUA XINPUT1_4.DLL)
+// 1. XINPUT PROXY FORWARDER (NẠP TRỰC TIẾP QUA XINPUT1_4.DLL)
 // ============================================================================
 static HMODULE g_origXInput = nullptr;
 
@@ -92,12 +92,11 @@ struct TrailPoint {
 };
 
 struct MegaHackV9Engine {
-    // Menu & Animation State
     bool menuOpen = false;
     bool particlePopupOpen = false;
-    float animProgress = 0.0f; // 0.0 (Closed) -> 1.0 (Open)
-    int animStyle = 0;         // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Scale
-    int hudAnchor = 0;         // 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Top-Center
+    float animProgress = 0.0f;
+    int animStyle = 0;   // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Pop
+    int hudAnchor = 0;   // 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Top-Center
 
     // Column 1: Cosmetic
     bool accuratePercentage = false;
@@ -143,7 +142,6 @@ struct MegaHackV9Engine {
     bool customBackground = false;
     int bgThemeIdx = 0;
     bool fastChests = false;
-    bool freeWindowResize = false;
 
     // Column 4: Display, Speedhack & AutoClicker
     bool speedhackEnabled = false;
@@ -175,7 +173,7 @@ struct MegaHackV9Engine {
     size_t macroCursor = 0;
     int physicsTick = 0;
 
-    // Runtime Metrics & Simulation
+    // Runtime Metrics
     int currentStartPosIdx = 0;
     int totalStartPosCount = 6;
     int totalFrames = 0;
@@ -192,13 +190,11 @@ struct MegaHackV9Engine {
     float simPlayerY = 260.0f;
     float simPlayerVelY = 0.0f;
 
-    // Input Edge Tracking
     bool prevTab = false;
     bool prevMouseLeft = false;
     bool prevKeyC = false;
     bool prevKeyQ = false;
     bool prevKeyE = false;
-    bool prevKeyR = false;
     bool prevJumpInput = false;
 
     bool isAnyCheatActive() const {
@@ -248,7 +244,7 @@ struct MegaHackV9Engine {
 static MegaHackV9Engine g_mh;
 
 // ============================================================================
-// 3. ENGINE MEMORY PATCHER & COCOS2D-X / VSYNC CONTROLLERS
+// 3. ENGINE MEMORY PATCHER & FPS / VSYNC CONTROLLERS
 // ============================================================================
 static uint8_t* findPatternInModule(HMODULE mod, const uint8_t* pattern, const char* mask) {
     if (!mod) return nullptr;
@@ -295,7 +291,6 @@ static void applyFpsAndVsyncSettings() {
         }
     }
 
-    // Call Cocos2d-x CCApplication::sharedApplication()->setAnimationInterval(1.0 / fps) if exported
     HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
     if (cocos) {
         using SharedAppFn = void*(__cdecl*)();
@@ -320,7 +315,6 @@ static void toggleNoclipMemoryPatch(bool enable) {
     if (!s_scanned) {
         s_scanned = true;
         HMODULE gd = GetModuleHandleA("GeometryDash.exe");
-        // Common x64 prologue for PlayLayer::destroyPlayer in GD 2.2081
         const uint8_t pat[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B, 0xF9, 0x48, 0x8B, 0xDA};
         s_destroyPlayerAddr = findPatternInModule(gd, pat, "xxxxxxxxxxxxxxxx");
         if (s_destroyPlayerAddr) {
@@ -384,7 +378,7 @@ static BOOL WINAPI hookedQueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCou
 }
 
 // ============================================================================
-// 5. OPENGL IMMEDIATE-MODE RENDERER (MEGA HACK V9 6-COLUMN DARK/CRIMSON UI)
+// 5. OPENGL IMMEDIATE-MODE RENDERER
 // ============================================================================
 static GLuint g_fontListBase = 0;
 static HDC g_fontDC = nullptr;
@@ -462,7 +456,7 @@ static bool pointInRect(float px, float py, float rx, float ry, float rw, float 
 }
 
 // ============================================================================
-// 6. MAIN FRAME OVERLAY & INTERACTION LOOP (CALLED ONCE PER FRAME)
+// 6. MAIN FRAME OVERLAY & INTERACTION LOOP
 // ============================================================================
 static LONGLONG g_lastOverlayTick = 0;
 
@@ -475,7 +469,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
     float viewW = static_cast<float>(std::max(1L, rc.right - rc.left));
     float viewH = static_cast<float>(std::max(1L, rc.bottom - rc.top));
 
-    // Calculate real frame delta time
     LARGE_INTEGER now = {};
     g_origQPC(&now);
     float dt = 1.0f / 240.0f;
@@ -488,7 +481,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
     g_mh.totalFrames++;
     g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * 140.0f, 360.0f);
 
-    // Poll Hardware Keyboard & Mouse
     bool tabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
     if (tabDown && !g_mh.prevTab) {
         g_mh.menuOpen = !g_mh.menuOpen;
@@ -536,7 +528,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
     }
     g_mh.prevJumpInput = jumpHeld;
 
-    // Auto Clicker & Macro Bot Execution
     if (!g_mh.menuOpen) {
         g_mh.physicsTick++;
         if (g_mh.autoClicker) {
@@ -558,7 +549,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         }
     }
 
-    // Update Smooth Menu Animation Progress
     float animSpeed = 4.8f * dt;
     if (g_mh.menuOpen) {
         g_mh.animProgress = std::min(1.0f, g_mh.animProgress + animSpeed);
@@ -566,14 +556,12 @@ static void renderMegaHackV9Frame(HDC hdc) {
         g_mh.animProgress = std::max(0.0f, g_mh.animProgress - animSpeed * 1.25f);
     }
 
-    // Mouse Cursor in Client Coordinates
     POINT pt = {};
     GetCursorPos(&pt);
     ScreenToClient(hwnd, &pt);
     float mx = static_cast<float>(pt.x);
     float my = static_cast<float>(pt.y);
 
-    // Setup 2D Orthographic OpenGL State (Top-Left Origin: 0,0 to viewW,viewH)
     ensureOpenGLFont(hdc);
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glPushMatrix();
@@ -592,9 +580,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // ------------------------------------------------------------------------
-    // A. IN-GAME TRAJECTORY, HITBOXES & RGB WAVE TRAIL OVERLAY
-    // ------------------------------------------------------------------------
     float accelY = jumpHeld ? -680.0f : 620.0f;
     g_mh.simPlayerVelY = std::clamp(g_mh.simPlayerVelY + accelY * dt, -380.0f, 380.0f);
     g_mh.simPlayerY = std::clamp(g_mh.simPlayerY + g_mh.simPlayerVelY * dt, viewH * 0.22f, viewH * 0.78f);
@@ -660,9 +645,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         glEnd();
     }
 
-    // ------------------------------------------------------------------------
-    // B. STATUS HUD & STARTPOS SWITCHER BAR (QOLMOD 4-CORNER ANCHOR)
-    // ------------------------------------------------------------------------
     float hudX = 16.0f;
     float hudY = 24.0f;
     if (g_mh.hudAnchor == 1) { hudX = viewW - 185.0f; hudY = 24.0f; }
@@ -670,10 +652,10 @@ static void renderMegaHackV9Frame(HDC hdc) {
     else if (g_mh.hudAnchor == 3) { hudX = viewW * 0.5f - 80.0f; hudY = 36.0f; }
 
     if (g_mh.cheatIndicator) {
-        float cr = 0.18f, cg = 0.82f, cb = 0.44f; // Clean Green
+        float cr = 0.18f, cg = 0.82f, cb = 0.44f;
         if (g_mh.isAnyCheatActive()) {
-            if (g_mh.isSafeProtected()) { cr = 0.95f; cg = 0.77f; cb = 0.06f; } // Safe Mode Yellow
-            else { cr = 0.92f; cg = 0.28f; cb = 0.24f; } // Active Cheat Red
+            if (g_mh.isSafeProtected()) { cr = 0.95f; cg = 0.77f; cb = 0.06f; }
+            else { cr = 0.92f; cg = 0.28f; cb = 0.24f; }
         }
         glDrawRect(hudX, hudY - 10.0f, 9.0f, 9.0f, cr, cg, cb, 0.95f);
         hudX += 15.0f;
@@ -716,7 +698,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         drawHudLine("Best Run: " + std::to_string(static_cast<int>(g_mh.bestRunFrom)) + "% - " + std::to_string(static_cast<int>(g_mh.bestRunTo)) + "%");
     }
 
-    // QOLMod On-Screen StartPos Switcher Bar
     if (g_mh.startPosSwitcher) {
         float barW = 160.0f;
         float barH = 24.0f;
@@ -733,7 +714,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
         }
     }
 
-    // Quick Top-Right MHv9 [Tab] Pill Button
     float pillW = 92.0f;
     float pillH = 22.0f;
     float pillX = viewW - pillW - 12.0f;
@@ -746,11 +726,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
         g_mh.menuOpen = !g_mh.menuOpen;
     }
 
-    // ------------------------------------------------------------------------
-    // C. 6-COLUMN MEGA HACK V9 PRO MENU WITH SMOOTH EASING ANIMATIONS
-    // ------------------------------------------------------------------------
     if (g_mh.animProgress > 0.005f) {
-        float eased = easeOutBack(g_mh.animProgress);
         glDrawRect(0.0f, 0.0f, viewW, viewH, 0.02f, 0.02f, 0.04f, 0.62f * g_mh.animProgress);
 
         float colW = std::min(192.0f, (viewW - 56.0f) / 6.0f);
@@ -774,8 +750,9 @@ static void renderMegaHackV9Frame(HDC hdc) {
             outY += 26.0f;
         };
 
-        auto drawToggleItem = [&](float colX, float& curY, const char* label, bool* state, std::function<void()> onChange = nullptr, std::function<void()> onSub = nullptr) {
-            bool hovered = pointInRect(mx, my, colX + 3.0f, curY, colW - (onSub ? 24.0f : 6.0f), rowH - 2.0f);
+        auto drawToggleFull = [&](float colX, float& curY, const char* label, bool* state, std::function<void()> onChange, std::function<void()> onSub) {
+            bool hasSub = static_cast<bool>(onSub);
+            bool hovered = pointInRect(mx, my, colX + 3.0f, curY, colW - (hasSub ? 24.0f : 6.0f), rowH - 2.0f);
             if (*state) {
                 glDrawRect(colX + 3.0f, curY, colW - 6.0f, rowH - 2.0f, 0.72f, 0.14f, 0.14f, hovered ? 0.55f : 0.42f);
                 glDrawRect(colX + 3.0f, curY, 3.5f, rowH - 2.0f, 0.96f, 0.24f, 0.24f, 1.0f);
@@ -791,7 +768,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
                 if (onChange) onChange();
             }
 
-            if (onSub) {
+            if (hasSub) {
                 bool subHover = pointInRect(mx, my, colX + colW - 21.0f, curY, 18.0f, rowH - 2.0f);
                 glDrawText(colX + colW - 15.0f, curY + 14.0f, "<", 0.98f, 0.78f, 0.32f, 1.0f);
                 if (mouseClicked && subHover && g_mh.menuOpen) {
@@ -799,6 +776,10 @@ static void renderMegaHackV9Frame(HDC hdc) {
                 }
             }
             curY += rowH;
+        };
+
+        auto drawToggleSimple = [&](float colX, float& curY, const char* label, bool* state) {
+            drawToggleFull(colX, curY, label, state, nullptr, nullptr);
         };
 
         auto drawStepperItem = [&](float colX, float& curY, const std::string& text, std::function<void(int)> onStep) {
@@ -832,39 +813,39 @@ static void renderMegaHackV9Frame(HDC hdc) {
         // Column 1: Cosmetic
         float cx = 0.f, cy = 0.f;
         beginColumn(0, "COSMETIC", 13, cx, cy);
-        drawToggleItem(cx, cy, "Accurate %", &g_mh.accuratePercentage);
-        drawToggleItem(cx, cy, "Ball Rotation Bug", &g_mh.ballRotationBug);
-        drawToggleItem(cx, cy, "No Glow", &g_mh.noGlow);
-        drawToggleItem(cx, cy, "No Particles", &g_mh.noParticles, nullptr, [&]() {
+        drawToggleSimple(cx, cy, "Accurate %", &g_mh.accuratePercentage);
+        drawToggleSimple(cx, cy, "Ball Rotation Bug", &g_mh.ballRotationBug);
+        drawToggleSimple(cx, cy, "No Glow", &g_mh.noGlow);
+        drawToggleFull(cx, cy, "No Particles", &g_mh.noParticles, nullptr, [&]() {
             g_mh.particlePopupOpen = !g_mh.particlePopupOpen;
         });
-        drawToggleItem(cx, cy, "No Portal Circle", &g_mh.noPortalCircle);
-        drawToggleItem(cx, cy, "No Mirror Portal", &g_mh.noMirrorPortal);
-        drawToggleItem(cx, cy, "No Camera Shake", &g_mh.noCameraShake);
-        drawToggleItem(cx, cy, "Layout Mode", &g_mh.layoutMode);
-        drawToggleItem(cx, cy, "Player on Top", &g_mh.playerOnTop);
-        drawToggleItem(cx, cy, "No Wave Trail", &g_mh.noWaveTrail);
-        drawToggleItem(cx, cy, "Solid Wave Trail", &g_mh.solidWaveTrail);
-        drawToggleItem(cx, cy, "P1 RGB Icons", &g_mh.p1RgbIcons);
-        drawToggleItem(cx, cy, "P2 RGB Icons", &g_mh.p2RgbIcons);
+        drawToggleSimple(cx, cy, "No Portal Circle", &g_mh.noPortalCircle);
+        drawToggleSimple(cx, cy, "No Mirror Portal", &g_mh.noMirrorPortal);
+        drawToggleSimple(cx, cy, "No Camera Shake", &g_mh.noCameraShake);
+        drawToggleSimple(cx, cy, "Layout Mode", &g_mh.layoutMode);
+        drawToggleSimple(cx, cy, "Player on Top", &g_mh.playerOnTop);
+        drawToggleSimple(cx, cy, "No Wave Trail", &g_mh.noWaveTrail);
+        drawToggleSimple(cx, cy, "Solid Wave Trail", &g_mh.solidWaveTrail);
+        drawToggleSimple(cx, cy, "P1 RGB Icons", &g_mh.p1RgbIcons);
+        drawToggleSimple(cx, cy, "P2 RGB Icons", &g_mh.p2RgbIcons);
 
         // Column 2: Level
         beginColumn(1, "LEVEL", 16, cx, cy);
-        drawToggleItem(cx, cy, "Noclip", &g_mh.noclip, [&]() {
+        drawToggleFull(cx, cy, "Noclip", &g_mh.noclip, [&]() {
             toggleNoclipMemoryPatch(g_mh.noclip || g_mh.noCollision);
-        });
-        drawToggleItem(cx, cy, "No Collision", &g_mh.noCollision, [&]() {
+        }, nullptr);
+        drawToggleFull(cx, cy, "No Collision", &g_mh.noCollision, [&]() {
             toggleNoclipMemoryPatch(g_mh.noclip || g_mh.noCollision);
-        });
-        drawToggleItem(cx, cy, "Safe Mode", &g_mh.safeMode);
-        drawToggleItem(cx, cy, "Auto Safe Mode", &g_mh.autoSafeMode);
-        drawToggleItem(cx, cy, "Force Ice", &g_mh.forceIce);
-        drawToggleItem(cx, cy, "Shipcopter", &g_mh.shipcopter);
-        drawToggleItem(cx, cy, "Show Trajectory", &g_mh.showTrajectory);
-        drawToggleItem(cx, cy, "Show Hitboxes", &g_mh.showHitboxes);
-        drawToggleItem(cx, cy, "Hitboxes on Death", &g_mh.showHitboxesOnDeath);
-        drawToggleItem(cx, cy, "Hitbox Trail", &g_mh.hitboxTrail);
-        drawToggleItem(cx, cy, "Hitbox Multiplier", &g_mh.hitboxMultiplier);
+        }, nullptr);
+        drawToggleSimple(cx, cy, "Safe Mode", &g_mh.safeMode);
+        drawToggleSimple(cx, cy, "Auto Safe Mode", &g_mh.autoSafeMode);
+        drawToggleSimple(cx, cy, "Force Ice", &g_mh.forceIce);
+        drawToggleSimple(cx, cy, "Shipcopter", &g_mh.shipcopter);
+        drawToggleSimple(cx, cy, "Show Trajectory", &g_mh.showTrajectory);
+        drawToggleSimple(cx, cy, "Show Hitboxes", &g_mh.showHitboxes);
+        drawToggleSimple(cx, cy, "Hitboxes on Death", &g_mh.showHitboxesOnDeath);
+        drawToggleSimple(cx, cy, "Hitbox Trail", &g_mh.hitboxTrail);
+        drawToggleSimple(cx, cy, "Hitbox Multiplier", &g_mh.hitboxMultiplier);
         {
             std::ostringstream hs;
             hs << "Hitbox: " << std::fixed << std::setprecision(2) << g_mh.hitboxScale << "x";
@@ -872,17 +853,17 @@ static void renderMegaHackV9Frame(HDC hdc) {
                 g_mh.hitboxScale = std::clamp(g_mh.hitboxScale + d * 0.10f, 0.10f, 3.00f);
             });
         }
-        drawToggleItem(cx, cy, "StartPos Switch [Q/E]", &g_mh.startPosSwitcher);
-        drawToggleItem(cx, cy, "Random Seed", &g_mh.fixedRandomSeed);
-        drawToggleItem(cx, cy, "Instant Complete", &g_mh.instantComplete);
-        drawToggleItem(cx, cy, "Frame Step [C]", &g_mh.frameStepper);
+        drawToggleSimple(cx, cy, "StartPos Switch [Q/E]", &g_mh.startPosSwitcher);
+        drawToggleSimple(cx, cy, "Random Seed", &g_mh.fixedRandomSeed);
+        drawToggleSimple(cx, cy, "Instant Complete", &g_mh.instantComplete);
+        drawToggleSimple(cx, cy, "Frame Step [C]", &g_mh.frameStepper);
 
         // Column 3: Universal
         beginColumn(2, "UNIVERSAL", 6, cx, cy);
-        drawToggleItem(cx, cy, "Custom BG", &g_mh.customBackground, nullptr, [&]() {
+        drawToggleFull(cx, cy, "Custom BG", &g_mh.customBackground, nullptr, [&]() {
             g_mh.bgThemeIdx = (g_mh.bgThemeIdx + 1) % 5;
         });
-        drawToggleItem(cx, cy, "Fast Chests", &g_mh.fastChests);
+        drawToggleSimple(cx, cy, "Fast Chests", &g_mh.fastChests);
         {
             const char* anchors[] = {"HUD: Top-Left", "HUD: Top-Right", "HUD: Bottom-Left", "HUD: Top-Center"};
             drawButtonItem(cx, cy, anchors[g_mh.hudAnchor], [&]() {
@@ -908,7 +889,7 @@ static void renderMegaHackV9Frame(HDC hdc) {
 
         // Column 4: Display & Speedhack
         beginColumn(3, "DISPLAY / SPEED", 7, cx, cy);
-        drawToggleItem(cx, cy, "Speedhack", &g_mh.speedhackEnabled);
+        drawToggleSimple(cx, cy, "Speedhack", &g_mh.speedhackEnabled);
         {
             std::ostringstream ss;
             ss << "Speed: " << std::fixed << std::setprecision(2) << g_mh.speedhackValue << "x";
@@ -916,36 +897,36 @@ static void renderMegaHackV9Frame(HDC hdc) {
                 g_mh.speedhackValue = std::clamp(g_mh.speedhackValue + d * 0.10f, 0.10f, 5.00f);
             });
         }
-        drawToggleItem(cx, cy, "Speedhack Audio", &g_mh.speedhackAudio);
-        drawToggleItem(cx, cy, "Frame Extrap.", &g_mh.frameExtrapolation, [&]() {
+        drawToggleSimple(cx, cy, "Speedhack Audio", &g_mh.speedhackAudio);
+        drawToggleFull(cx, cy, "Frame Extrap.", &g_mh.frameExtrapolation, [&]() {
             applyFpsAndVsyncSettings();
-        });
+        }, nullptr);
         drawStepperItem(cx, cy, "FPS: " + std::to_string(g_mh.targetFps), [&](int d) {
             g_mh.targetFps = std::clamp(g_mh.targetFps + d * 120, 60, 1440);
             applyFpsAndVsyncSettings();
         });
-        drawToggleItem(cx, cy, "Auto Clicker", &g_mh.autoClicker);
+        drawToggleSimple(cx, cy, "Auto Clicker", &g_mh.autoClicker);
         drawStepperItem(cx, cy, "Click CPS: " + std::to_string(g_mh.autoClickCps), [&](int d) {
             g_mh.autoClickCps = std::clamp(g_mh.autoClickCps + d * 5, 5, 60);
         });
 
         // Column 5: Status HUD
         beginColumn(4, "STATUS HUD", 7, cx, cy);
-        drawToggleItem(cx, cy, "Cheat Indicator", &g_mh.cheatIndicator);
-        drawToggleItem(cx, cy, "FPS Counter", &g_mh.showFps);
-        drawToggleItem(cx, cy, "CPS Counter", &g_mh.showCps);
-        drawToggleItem(cx, cy, "Noclip Accuracy", &g_mh.showNoclipAccuracy);
-        drawToggleItem(cx, cy, "Noclip Deaths", &g_mh.showNoclipDeaths);
-        drawToggleItem(cx, cy, "Attempts", &g_mh.showAttempts);
-        drawToggleItem(cx, cy, "Best Run", &g_mh.showBestRun);
+        drawToggleSimple(cx, cy, "Cheat Indicator", &g_mh.cheatIndicator);
+        drawToggleSimple(cx, cy, "FPS Counter", &g_mh.showFps);
+        drawToggleSimple(cx, cy, "CPS Counter", &g_mh.showCps);
+        drawToggleSimple(cx, cy, "Noclip Accuracy", &g_mh.showNoclipAccuracy);
+        drawToggleSimple(cx, cy, "Noclip Deaths", &g_mh.showNoclipDeaths);
+        drawToggleSimple(cx, cy, "Attempts", &g_mh.showAttempts);
+        drawToggleSimple(cx, cy, "Best Run", &g_mh.showBestRun);
 
         // Column 6: Bypass & Macro Bot
         beginColumn(5, "BYPASS & BOT", 7, cx, cy);
-        drawToggleItem(cx, cy, "Unlock All Icons", &g_mh.iconBypass);
-        drawToggleItem(cx, cy, "Copy Hack", &g_mh.copyHack);
-        drawToggleItem(cx, cy, "Verify Hack", &g_mh.verifyHack);
-        drawToggleItem(cx, cy, "Practice Music", &g_mh.practiceMusicSync);
-        drawToggleItem(cx, cy, "Level Edit", &g_mh.levelEditBypass);
+        drawToggleSimple(cx, cy, "Unlock All Icons", &g_mh.iconBypass);
+        drawToggleSimple(cx, cy, "Copy Hack", &g_mh.copyHack);
+        drawToggleSimple(cx, cy, "Verify Hack", &g_mh.verifyHack);
+        drawToggleSimple(cx, cy, "Practice Music", &g_mh.practiceMusicSync);
+        drawToggleSimple(cx, cy, "Level Edit", &g_mh.levelEditBypass);
         {
             const char* botStates[] = {"Bot: Disabled", "Bot: Recording", "Bot: Playback"};
             drawButtonItem(cx, cy, botStates[g_mh.macroMode], [&]() {
@@ -961,7 +942,6 @@ static void renderMegaHackV9Frame(HDC hdc) {
             g_mh.macroMode = 0;
         });
 
-        // Granular No Particles Filter Modal (<)
         if (g_mh.particlePopupOpen) {
             float pw = 210.0f;
             float ph = 128.0f;
@@ -975,10 +955,10 @@ static void renderMegaHackV9Frame(HDC hdc) {
             float itemY = py + 28.0f;
             float savedColW = colW;
             colW = pw;
-            drawToggleItem(px, itemY, "Portal Effect (Keep)", &g_mh.keepPortalParticles);
-            drawToggleItem(px, itemY, "Hide Ground Particles", &g_mh.hideGroundParticles);
-            drawToggleItem(px, itemY, "Hide Trail Particles", &g_mh.hideTrailParticles);
-            drawToggleItem(px, itemY, "Hide Click Particles", &g_mh.hideClickParticles);
+            drawToggleSimple(px, itemY, "Portal Effect (Keep)", &g_mh.keepPortalParticles);
+            drawToggleSimple(px, itemY, "Hide Ground Particles", &g_mh.hideGroundParticles);
+            drawToggleSimple(px, itemY, "Hide Trail Particles", &g_mh.hideTrailParticles);
+            drawToggleSimple(px, itemY, "Hide Click Particles", &g_mh.hideClickParticles);
             colW = savedColW;
         }
     }
@@ -1042,7 +1022,6 @@ static void hookModuleIAT(HMODULE mod, const char* targetFuncName, void* newFunc
 }
 
 static DWORD WINAPI megaHackInitThread(LPVOID) {
-    // Wait until GeometryDash.exe and libcocos2d.dll are initialized in memory
     for (int retry = 0; retry < 100; ++retry) {
         if (GetModuleHandleA("libcocos2d.dll") && GetModuleHandleA("opengl32.dll")) break;
         Sleep(50);
