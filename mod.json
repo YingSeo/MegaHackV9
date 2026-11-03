@@ -8,9 +8,9 @@
     },
     "id": "absolute.megahack_v9",
     "name": "Mega Hack v9 Pro",
-    "version": "v9.1.0",
+    "version": "v9.5.0",
     "developer": "Absolute",
-    "description": "Full-featured Mega Hack v9 + QOLMod Engine for Geometry Dash 2.2081. Press TAB to toggle.",
+    "description": "Mega Hack v9.5.0 Ultimate + QOLMod Engine for Geometry Dash 2.2081. Press TAB to open.",
     "tags": ["gameplay", "interface", "utility", "enhancement", "cheats"],
     "early-load": true
 }
