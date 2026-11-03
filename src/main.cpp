@@ -1,5 +1,4 @@
 #include <Geode/Geode.hpp>
-#include <Geode/Bindings.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -8,7 +7,6 @@
 #include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/MenuLayer.hpp>
-#include <Geode/modify/CreatorLayer.hpp>
 #include <Geode/modify/GJGarageLayer.hpp>
 #include <cmath>
 #include <vector>
@@ -22,7 +20,7 @@
 using namespace geode::prelude;
 
 // ============================================================================
-// 1. GLOBAL ENGINE DATA & MACRO STRUCTURES (ALL DEFAULT TO OFF)
+// 1. GLOBAL ENGINE STATE & MACRO STRUCTURES (ALL DEFAULT TO OFF)
 // ============================================================================
 struct MacroTickAction {
     int tick;
@@ -32,7 +30,7 @@ struct MacroTickAction {
 
 struct MegaHackProState {
     bool menuOpen = false;
-    int animStyle = 0;   // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Scale
+    int animStyle = 0;   // 0: Smooth Expo+Back, 1: Slide Down, 2: Elastic Pop
     int hudAnchor = 0;   // 0: Top-Left, 1: Top-Right, 2: Bottom-Left, 3: Top-Center
 
     // Column 1: Cosmetic & Visuals
@@ -103,9 +101,9 @@ struct MegaHackProState {
     int physicsTick = 0;
     bool replayingInputNow = false;
 
-    // Runtime Tracking
+    // Runtime Level Tracking
     std::vector<cocos2d::CCPoint> startPosList;
-    int currentStartPosIdx = -1;
+    int currentStartPosIdx = 0;
     bool inPlayLayerInit = false;
     int totalFrames = 0;
     int noclipHitFrames = 0;
@@ -182,7 +180,7 @@ struct ActionCallbackData : public cocos2d::CCObject {
 };
 
 // ============================================================================
-// 2. COLOR & ENGINE HELPER FUNCTIONS
+// 2. PURE COCOS2D-X HELPER FUNCTIONS (ZERO BINDING CONFLICTS)
 // ============================================================================
 static std::string formatFloat(const char* prefix, float val, const char* suffix, int decimals = 2) {
     std::ostringstream ss;
@@ -233,12 +231,12 @@ static cocos2d::CCSprite* makeSolidSprite(float w, float h, cocos2d::ccColor3B c
 static void applyCustomMenuBg(cocos2d::CCNode* layer) {
     if (!layer || !g_mh.customBackground) return;
     auto col = kBgThemes[g_mh.bgThemeIdx % 5];
-    if (auto bg = typeinfo_cast<cocos2d::CCRGBAProtocol*>(layer->getChildByID("background"))) {
+    if (auto bg = dynamic_cast<cocos2d::CCSprite*>(layer->getChildByID("background"))) {
         bg->setColor(col);
     }
     if (auto children = layer->getChildren()) {
         for (unsigned int i = 0; i < children->count(); ++i) {
-            if (auto spr = typeinfo_cast<cocos2d::CCSprite*>(children->objectAtIndex(i))) {
+            if (auto spr = dynamic_cast<cocos2d::CCSprite*>(children->objectAtIndex(i))) {
                 if (spr->getZOrder() <= -1) {
                     spr->setColor(col);
                 }
@@ -277,18 +275,30 @@ public:
     static MegaHackV9Overlay* getOrCreate() {
         auto scene = cocos2d::CCDirector::sharedDirector()->getRunningScene();
         if (!scene) return nullptr;
-        if (auto existing = typeinfo_cast<MegaHackV9Overlay*>(scene->getChildByID("mhv9-pro-ui"_spr))) {
+        if (auto existing = dynamic_cast<MegaHackV9Overlay*>(scene->getChildByID("mhv9-pro-ui"))) {
             return existing;
         }
         auto ret = new MegaHackV9Overlay();
         if (ret && ret->init()) {
             ret->autorelease();
-            ret->setID("mhv9-pro-ui"_spr);
+            ret->setID("mhv9-pro-ui");
             scene->addChild(ret, 99999);
             return ret;
         }
         CC_SAFE_DELETE(ret);
         return nullptr;
+    }
+
+    void onExternalToggleButton(cocos2d::CCObject*) {
+        this->toggleMenu();
+    }
+
+    void onPrevStartPosButton(cocos2d::CCObject*) {
+        switchStartPos(-1);
+    }
+
+    void onNextStartPosButton(cocos2d::CCObject*) {
+        switchStartPos(+1);
     }
 
     bool init() override {
@@ -355,7 +365,7 @@ public:
     void addToggleRow(cocos2d::CCNode* col, float& curY, const char* text, bool* ptr, std::function<void()> onChange = nullptr, std::function<void()> onArrow = nullptr) {
         float w = col->getContentSize().width;
         float rowH = 13.0f;
-        auto menu = typeinfo_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
+        auto menu = dynamic_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
         if (!menu) return;
 
         auto bg = makeSolidSprite(
@@ -380,7 +390,7 @@ public:
         lbl->setColor(*ptr ? cocos2d::ccColor3B{255, 255, 255} : cocos2d::ccColor3B{192, 194, 206});
         bg->addChild(lbl);
 
-        auto btn = CCMenuItemSpriteExtra::create(bg, this, menu_selector(MegaHackV9Overlay::onToggleClicked));
+        auto btn = cocos2d::CCMenuItemSprite::create(bg, bg, this, menu_selector(MegaHackV9Overlay::onToggleClicked));
         btn->setPosition({w * 0.5f, curY});
 
         auto meta = new ToggleCallbackData();
@@ -397,7 +407,7 @@ public:
             auto arrLbl = cocos2d::CCLabelBMFont::create("<", "bigFont.fnt");
             arrLbl->setScale(0.20f);
             arrLbl->setColor({245, 192, 78});
-            auto arrBtn = CCMenuItemSpriteExtra::create(arrLbl, this, menu_selector(MegaHackV9Overlay::onActionClicked));
+            auto arrBtn = cocos2d::CCMenuItemSprite::create(arrLbl, arrLbl, this, menu_selector(MegaHackV9Overlay::onActionClicked));
             arrBtn->setPosition({w - 8.5f, curY});
             auto act = new ActionCallbackData();
             act->autorelease();
@@ -412,7 +422,7 @@ public:
     void addStepperRow(cocos2d::CCNode* col, float& curY, const char* initText, cocos2d::CCLabelBMFont** outLbl, std::function<void(int)> onStep) {
         float w = col->getContentSize().width;
         float rowH = 13.0f;
-        auto menu = typeinfo_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
+        auto menu = dynamic_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
         if (!menu) return;
 
         auto lbl = cocos2d::CCLabelBMFont::create(initText, "chatFont.fnt");
@@ -426,7 +436,7 @@ public:
         auto addStepBtn = [&](const char* sym, float xPos, int dir) {
             auto bLbl = cocos2d::CCLabelBMFont::create(sym, "bigFont.fnt");
             bLbl->setScale(0.23f);
-            auto btn = CCMenuItemSpriteExtra::create(bLbl, this, menu_selector(MegaHackV9Overlay::onActionClicked));
+            auto btn = cocos2d::CCMenuItemSprite::create(bLbl, bLbl, this, menu_selector(MegaHackV9Overlay::onActionClicked));
             btn->setPosition({xPos, curY});
             auto act = new ActionCallbackData();
             act->autorelease();
@@ -443,7 +453,7 @@ public:
     void addActionButtonRow(cocos2d::CCNode* col, float& curY, const char* title, cocos2d::CCLabelBMFont** outLbl, std::function<void()> onClick) {
         float w = col->getContentSize().width;
         float rowH = 13.5f;
-        auto menu = typeinfo_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
+        auto menu = dynamic_cast<cocos2d::CCMenu*>(col->getChildByID("column-menu"));
         if (!menu) return;
 
         auto bg = makeSolidSprite(w - 5.5f, rowH - 1.5f, {40, 44, 62}, 240);
@@ -455,7 +465,7 @@ public:
         bg->addChild(lbl);
         if (outLbl) *outLbl = lbl;
 
-        auto btn = CCMenuItemSpriteExtra::create(bg, this, menu_selector(MegaHackV9Overlay::onActionClicked));
+        auto btn = cocos2d::CCMenuItemSprite::create(bg, bg, this, menu_selector(MegaHackV9Overlay::onActionClicked));
         btn->setPosition({w * 0.5f, curY});
         auto act = new ActionCallbackData();
         act->autorelease();
@@ -467,7 +477,7 @@ public:
     }
 
     void onToggleClicked(cocos2d::CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto btn = static_cast<cocos2d::CCMenuItemSprite*>(sender);
         auto meta = static_cast<ToggleCallbackData*>(btn->getUserObject());
         if (!meta || !meta->statePtr) return;
 
@@ -484,7 +494,7 @@ public:
     }
 
     void onActionClicked(cocos2d::CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto btn = static_cast<cocos2d::CCMenuItemSprite*>(sender);
         auto act = static_cast<ActionCallbackData*>(btn->getUserObject());
         if (act && act->onTrigger) act->onTrigger();
     }
@@ -779,6 +789,15 @@ public:
     }
 };
 
+static cocos2d::CCMenuItemSprite* createPillButton(const char* text, cocos2d::CCObject* target, cocos2d::SEL_MenuHandler selector) {
+    auto bg = makeSolidSprite(62.0f, 16.0f, {210, 38, 38}, 240);
+    auto lbl = cocos2d::CCLabelBMFont::create(text, "bigFont.fnt");
+    lbl->setScale(0.26f);
+    lbl->setPosition({31.0f, 8.0f});
+    bg->addChild(lbl);
+    return cocos2d::CCMenuItemSprite::create(bg, bg, target, selector);
+}
+
 // ============================================================================
 // 4. KEYBOARD HOOK (TAB MENU, 'C' FRAME STEPPER, 'Q'/'E' STARTPOS SWITCHER)
 // ============================================================================
@@ -886,12 +905,169 @@ class $modify(MHPlayerHook, PlayerObject) {
 };
 
 // ============================================================================
-// 8. GJBASEGAMELAYER & PLAYLAYER HOOKS (NOCLIP, HITBOX, TRAJECTORY, BOT, HUD)
+// 8. PLAYLAYER & GJBASEGAMELAYER HOOKS (NOCLIP, HITBOX, TRAJECTORY, BOT, HUD)
 // ============================================================================
+static cocos2d::CCDrawNode* s_drawOverlay = nullptr;
+static cocos2d::CCLabelBMFont* s_hudLabel = nullptr;
+static cocos2d::CCLayerColor* s_indicatorDot = nullptr;
+static cocos2d::CCNode* s_startPosBar = nullptr;
+static cocos2d::CCLabelBMFont* s_startPosBarLbl = nullptr;
+
+static void drawTrajectoryOverlay(PlayerObject* p) {
+    if (!s_drawOverlay || !p) return;
+    cocos2d::CCPoint start = p->getPosition();
+    float vx = std::max(3.2f, std::abs(g_mh.p1VelSmooth.x));
+    float vyHold = g_mh.p1VelSmooth.y;
+    float vyRel  = g_mh.p1VelSmooth.y;
+
+    cocos2d::CCPoint prevHold = start;
+    cocos2d::CCPoint prevRel  = start;
+
+    for (int i = 1; i <= 45; ++i) {
+        vyHold = std::clamp(vyHold + 0.36f, -12.f, 12.f);
+        vyRel  = std::clamp(vyRel  - 0.36f, -12.f, 12.f);
+
+        cocos2d::CCPoint nextHold = {prevHold.x + vx, std::max(0.f, prevHold.y + vyHold)};
+        cocos2d::CCPoint nextRel  = {prevRel.x  + vx, std::max(0.f, prevRel.y  + vyRel)};
+
+        s_drawOverlay->drawSegment(prevHold, nextHold, 0.85f, {0.2f, 0.95f, 0.45f, 0.88f});
+        s_drawOverlay->drawSegment(prevRel,  nextRel,  0.65f, {0.95f, 0.35f, 0.35f, 0.68f});
+
+        prevHold = nextHold;
+        prevRel  = nextRel;
+    }
+}
+
+static void drawHitboxOverlay(PlayLayer* pl) {
+    if (!s_drawOverlay || !pl) return;
+    auto drawRectBox = [&](cocos2d::CCRect r, cocos2d::ccColor4F col) {
+        cocos2d::CCPoint pts[4] = {
+            {r.getMinX(), r.getMinY()},
+            {r.getMaxX(), r.getMinY()},
+            {r.getMaxX(), r.getMaxY()},
+            {r.getMinX(), r.getMaxY()}
+        };
+        s_drawOverlay->drawPolygon(pts, 4, {col.r, col.g, col.b, 0.14f}, 0.65f, col);
+    };
+
+    if (g_mh.hitboxTrail) {
+        for (const auto& oldRect : g_mh.hitboxTrailHistory) {
+            drawRectBox(oldRect, {0.15f, 0.9f, 0.5f, 0.45f});
+        }
+    }
+
+    if (pl->m_player1) {
+        drawRectBox(pl->m_player1->boundingBox(), {0.1f, 1.0f, 0.3f, 0.95f});
+    }
+
+    if (auto objLayer = pl->getChildByID("object-layer")) {
+        if (auto children = objLayer->getChildren()) {
+            float px = pl->m_player1 ? pl->m_player1->getPositionX() : 0.f;
+            for (unsigned int i = 0; i < children->count(); ++i) {
+                auto node = dynamic_cast<cocos2d::CCNode*>(children->objectAtIndex(i));
+                if (!node || node == pl->m_player1 || node == pl->m_player2 || node == s_drawOverlay) continue;
+                if (std::abs(node->getPositionX() - px) < 260.0f) {
+                    cocos2d::CCRect r = node->boundingBox();
+                    if (r.size.width > 2.0f && r.size.width < 120.0f && r.size.height > 2.0f && r.size.height < 120.0f) {
+                        if (g_mh.hitboxMultiplier) {
+                            float cx = r.getMidX();
+                            float cy = r.getMidY();
+                            float sw = r.size.width * g_mh.hitboxScale;
+                            float sh = r.size.height * g_mh.hitboxScale;
+                            r = cocos2d::CCRect(cx - sw * 0.5f, cy - sh * 0.5f, sw, sh);
+                        }
+                        drawRectBox(r, {1.0f, 0.22f, 0.22f, 0.85f});
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void updateStatusHudOverlay(float dt) {
+    auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+
+    if (s_indicatorDot) {
+        s_indicatorDot->setVisible(g_mh.cheatIndicator);
+        if (g_mh.cheatIndicator) {
+            cocos2d::ccColor3B c = {46, 204, 113};
+            if (g_mh.isCheating()) {
+                c = g_mh.shouldProtectProgress() ? cocos2d::ccColor3B{241, 196, 15} : cocos2d::ccColor3B{231, 76, 60};
+            }
+            s_indicatorDot->setColor(c);
+        }
+    }
+
+    if (s_startPosBar) {
+        bool showBar = g_mh.startPosSwitcher && !g_mh.startPosList.empty();
+        s_startPosBar->setVisible(showBar);
+        if (showBar && s_startPosBarLbl) {
+            std::ostringstream spTxt;
+            spTxt << (g_mh.currentStartPosIdx + 1) << " / " << g_mh.startPosList.size();
+            s_startPosBarLbl->setString(spTxt.str().c_str());
+        }
+    }
+
+    if (!s_hudLabel) return;
+
+    if (g_mh.hudAnchor == 0) {
+        s_hudLabel->setAnchorPoint({0.0f, 1.0f});
+        s_hudLabel->setPosition({14.0f, winSize.height - 6.0f});
+    } else if (g_mh.hudAnchor == 1) {
+        s_hudLabel->setAnchorPoint({1.0f, 1.0f});
+        s_hudLabel->setPosition({winSize.width - 10.0f, winSize.height - 6.0f});
+    } else if (g_mh.hudAnchor == 2) {
+        s_hudLabel->setAnchorPoint({0.0f, 0.0f});
+        s_hudLabel->setPosition({14.0f, 8.0f});
+    } else {
+        s_hudLabel->setAnchorPoint({0.5f, 1.0f});
+        s_hudLabel->setPosition({winSize.width * 0.5f, winSize.height - 20.0f});
+    }
+
+    std::ostringstream ss;
+    if (g_mh.showFps) {
+        int fps = g_mh.frameExtrapolation
+            ? static_cast<int>(g_mh.targetFps)
+            : static_cast<int>(std::round(1.0f / std::max(dt, 0.0005f)));
+        ss << "FPS: " << fps << " (240 TPS)\n";
+    }
+    if (g_mh.showCps) {
+        float now = cocos2d::CCDirector::sharedDirector()->getTotalFrames() / 60.0f;
+        g_mh.clickTimestamps.erase(
+            std::remove_if(g_mh.clickTimestamps.begin(), g_mh.clickTimestamps.end(),
+                           [now](float t) { return (now - t) > 1.0f; }),
+            g_mh.clickTimestamps.end()
+        );
+        if (g_mh.clickTimestamps.size() > g_mh.peakCps) {
+            g_mh.peakCps = g_mh.clickTimestamps.size();
+        }
+        ss << "CPS: " << g_mh.clickTimestamps.size() << " (Peak: " << g_mh.peakCps << ")\n";
+    }
+    if (g_mh.showNoclipAccuracy) {
+        float acc = g_mh.totalFrames > 0
+            ? (1.0f - static_cast<float>(g_mh.noclipHitFrames) / static_cast<float>(g_mh.totalFrames)) * 100.0f
+            : 100.0f;
+        ss << "Accuracy: " << std::fixed << std::setprecision(2) << std::clamp(acc, 0.0f, 100.0f) << "%\n";
+    }
+    if (g_mh.showNoclipDeaths) {
+        ss << "Noclip Deaths: " << g_mh.noclipDeaths << "\n";
+    }
+    if (g_mh.showAttempts) {
+        ss << "Attempt " << g_mh.attemptCount << "\n";
+    }
+    if (g_mh.showBestRun) {
+        ss << "Best Run: " << static_cast<int>(g_mh.bestRunFrom) << "% - " << static_cast<int>(g_mh.bestRunTo) << "%\n";
+    }
+
+    s_hudLabel->setString(ss.str().c_str());
+}
+
 class $modify(MHBaseGameHook, GJBaseGameLayer) {
     void update(float dt) {
         auto pl = PlayLayer::get();
-        if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
+        bool isActivePlayLayer = (pl && static_cast<GJBaseGameLayer*>(pl) == this);
+
+        if (isActivePlayLayer) {
             if (g_mh.frameStepper) {
                 if (!g_mh.stepRequested) return;
                 g_mh.stepRequested = false;
@@ -935,54 +1111,169 @@ class $modify(MHBaseGameHook, GJBaseGameLayer) {
             }
         }
 
+        g_mh.collidingThisFrame = false;
         GJBaseGameLayer::update(dt);
 
-        if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
-            if (g_mh.noMirrorPortal) {
-                if (this->getScaleX() < 0.0f) this->setScaleX(std::abs(this->getScaleX()));
+        if (isActivePlayLayer && pl) {
+            g_mh.totalFrames++;
+
+            if (g_mh.noMirrorPortal && this->getScaleX() < 0.0f) {
+                this->setScaleX(std::abs(this->getScaleX()));
             }
             if (g_mh.noCameraShake) {
                 this->setRotation(0.0f);
             }
+
+            // Frame Extrapolation visual smoothing
+            if (g_mh.frameExtrapolation && pl->m_player1 && !g_mh.playerIsDead) {
+                cocos2d::CCPoint cur = pl->m_player1->getPosition();
+                cocos2d::CCPoint delta = {cur.x - g_mh.p1PrevPos.x, cur.y - g_mh.p1PrevPos.y};
+                if (std::hypot(delta.x, delta.y) < 45.0f) {
+                    g_mh.p1VelSmooth = {
+                        g_mh.p1VelSmooth.x * 0.65f + delta.x * 0.35f,
+                        g_mh.p1VelSmooth.y * 0.65f + delta.y * 0.35f
+                    };
+                    float alpha = std::clamp((dt * g_mh.targetFps) - 1.0f, 0.0f, 0.85f);
+                    pl->m_player1->setPosition({
+                        cur.x + g_mh.p1VelSmooth.x * alpha * 0.25f,
+                        cur.y + g_mh.p1VelSmooth.y * alpha * 0.25f
+                    });
+                }
+                g_mh.p1PrevPos = cur;
+            } else if (pl->m_player1) {
+                cocos2d::CCPoint cur = pl->m_player1->getPosition();
+                g_mh.p1VelSmooth = {cur.x - g_mh.p1PrevPos.x, cur.y - g_mh.p1PrevPos.y};
+                g_mh.p1PrevPos = cur;
+            }
+
+            if (g_mh.playerOnTop) {
+                if (pl->m_player1) pl->m_player1->setZOrder(10000);
+                if (pl->m_player2) pl->m_player2->setZOrder(10000);
+            }
+
+            // No Glow, No Particles & Layout Mode via standard dynamic_cast
+            if (g_mh.noGlow || g_mh.noParticles || g_mh.layoutMode) {
+                if (auto objLayer = pl->getChildByID("object-layer")) {
+                    if (auto children = objLayer->getChildren()) {
+                        for (unsigned int i = 0; i < children->count(); ++i) {
+                            auto child = static_cast<cocos2d::CCNode*>(children->objectAtIndex(i));
+                            if (!child || child == s_drawOverlay) continue;
+
+                            if (g_mh.noParticles) {
+                                if (auto part = dynamic_cast<cocos2d::CCParticleSystemQuad*>(child)) {
+                                    part->setVisible(false);
+                                }
+                            }
+                            if (g_mh.noGlow || g_mh.layoutMode) {
+                                if (auto spr = dynamic_cast<cocos2d::CCSprite*>(child)) {
+                                    if (spr->getBlendFunc().dst == GL_ONE) {
+                                        spr->setVisible(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // P1 & P2 RGB Icons
+            g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * 145.0f, 360.0f);
+            auto c1 = hsvToRgb(g_mh.rgbHue, 0.85f, 1.0f);
+            auto c2 = hsvToRgb(std::fmod(g_mh.rgbHue + 180.0f, 360.0f), 0.85f, 1.0f);
+
+            if (pl->m_player1 && g_mh.p1RgbIcons) pl->m_player1->setColor(c1);
+            if (pl->m_player2 && g_mh.p2RgbIcons) pl->m_player2->setColor(c2);
+
+            // Accurate Percentage
+            if (g_mh.accuratePercentage && pl->m_player1) {
+                if (auto pctLbl = dynamic_cast<cocos2d::CCLabelBMFont*>(pl->getChildByID("percentage-label"))) {
+                    float pct = std::clamp((pl->m_player1->getPositionX() / std::max(1.0f, g_mh.maxLevelX)) * 100.0f, 0.0f, 100.0f);
+                    pctLbl->setString(formatFloat("", pct, "%", 2).c_str());
+                }
+            }
+
+            // Hitbox Trail History
+            if (g_mh.hitboxTrail && pl->m_player1 && !g_mh.playerIsDead) {
+                g_mh.hitboxTrailHistory.push_back(pl->m_player1->boundingBox());
+                if (g_mh.hitboxTrailHistory.size() > 45) {
+                    g_mh.hitboxTrailHistory.pop_front();
+                }
+            }
+
+            // Trajectory & Hitbox Overlay
+            if (s_drawOverlay) {
+                s_drawOverlay->clear();
+                if (g_mh.showTrajectory && pl->m_player1 && !g_mh.playerIsDead) {
+                    drawTrajectoryOverlay(pl->m_player1);
+                }
+                if ((g_mh.showHitboxes || (g_mh.showHitboxesOnDeath && g_mh.playerIsDead)) && pl->m_player1) {
+                    drawHitboxOverlay(pl);
+                }
+            }
+
+            updateStatusHudOverlay(dt);
         }
     }
 };
 
 class $modify(MHPlayLayerHook, PlayLayer) {
-    struct Fields {
-        cocos2d::CCDrawNode* m_drawOverlay = nullptr;
-        cocos2d::CCLabelBMFont* m_hudLabel = nullptr;
-        cocos2d::CCLayerColor* m_indicatorDot = nullptr;
-    };
-
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         g_mh.inPlayLayerInit = true;
         bool res = PlayLayer::init(level, useReplay, dontCreateObjects);
         g_mh.inPlayLayerInit = false;
         if (!res) return false;
 
-        m_fields->m_drawOverlay = cocos2d::CCDrawNode::create();
+        s_drawOverlay = cocos2d::CCDrawNode::create();
         if (auto objLayer = this->getChildByID("object-layer")) {
-            objLayer->addChild(m_fields->m_drawOverlay, 9999);
+            objLayer->addChild(s_drawOverlay, 9999);
         } else {
-            this->addChild(m_fields->m_drawOverlay, 9999);
+            this->addChild(s_drawOverlay, 9999);
         }
 
         auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        m_fields->m_hudLabel = cocos2d::CCLabelBMFont::create("", "chatFont.fnt");
-        m_fields->m_hudLabel->setScale(0.44f);
-        m_fields->m_hudLabel->setAnchorPoint({0.0f, 1.0f});
-        m_fields->m_hudLabel->setPosition({14.0f, winSize.height - 6.0f});
-        m_fields->m_hudLabel->setOpacity(225);
-        this->addChild(m_fields->m_hudLabel, 9998);
+        s_hudLabel = cocos2d::CCLabelBMFont::create("", "chatFont.fnt");
+        s_hudLabel->setScale(0.44f);
+        s_hudLabel->setAnchorPoint({0.0f, 1.0f});
+        s_hudLabel->setPosition({14.0f, winSize.height - 6.0f});
+        s_hudLabel->setOpacity(225);
+        this->addChild(s_hudLabel, 9998);
 
-        m_fields->m_indicatorDot = cocos2d::CCLayerColor::create({46, 204, 113, 255}, 5.0f, 5.0f);
-        m_fields->m_indicatorDot->setPosition({6.0f, winSize.height - 11.0f});
-        m_fields->m_indicatorDot->setVisible(false);
-        this->addChild(m_fields->m_indicatorDot, 9998);
+        s_indicatorDot = cocos2d::CCLayerColor::create({46, 204, 113, 255}, 5.0f, 5.0f);
+        s_indicatorDot->setPosition({6.0f, winSize.height - 11.0f});
+        s_indicatorDot->setVisible(false);
+        this->addChild(s_indicatorDot, 9998);
+
+        // QOLMod-style On-Screen StartPos Switcher Widget (< 1 / 6 >)
+        if (auto uiTarget = MegaHackV9Overlay::getOrCreate()) {
+            s_startPosBar = cocos2d::CCNode::create();
+            s_startPosBar->setPosition({winSize.width * 0.5f, 18.0f});
+            s_startPosBar->setVisible(false);
+
+            auto spMenu = cocos2d::CCMenu::create();
+            spMenu->setPosition({0.0f, 0.0f});
+
+            auto prevSpr = cocos2d::CCLabelBMFont::create("<", "bigFont.fnt");
+            prevSpr->setScale(0.42f);
+            auto prevBtn = cocos2d::CCMenuItemSprite::create(prevSpr, prevSpr, uiTarget, menu_selector(MegaHackV9Overlay::onPrevStartPosButton));
+            prevBtn->setPosition({-42.0f, 0.0f});
+            spMenu->addChild(prevBtn);
+
+            auto nextSpr = cocos2d::CCLabelBMFont::create(">", "bigFont.fnt");
+            nextSpr->setScale(0.42f);
+            auto nextBtn = cocos2d::CCMenuItemSprite::create(nextSpr, nextSpr, uiTarget, menu_selector(MegaHackV9Overlay::onNextStartPosButton));
+            nextBtn->setPosition({42.0f, 0.0f});
+            spMenu->addChild(nextBtn);
+
+            s_startPosBarLbl = cocos2d::CCLabelBMFont::create("1 / 6", "bigFont.fnt");
+            s_startPosBarLbl->setScale(0.32f);
+            s_startPosBarLbl->setOpacity(200);
+            s_startPosBar->addChild(s_startPosBarLbl, 1);
+            s_startPosBar->addChild(spMenu, 2);
+            this->addChild(s_startPosBar, 9998);
+        }
 
         g_mh.startPosList.clear();
-        g_mh.currentStartPosIdx = -1;
+        g_mh.currentStartPosIdx = 0;
         g_mh.maxLevelX = 2400.0f;
         g_mh.attemptCount = 1;
         g_mh.peakCps = 0;
@@ -990,7 +1281,7 @@ class $modify(MHPlayLayerHook, PlayLayer) {
         if (auto objLayer = this->getChildByID("object-layer")) {
             if (auto children = objLayer->getChildren()) {
                 for (unsigned int i = 0; i < children->count(); ++i) {
-                    if (auto node = typeinfo_cast<cocos2d::CCNode*>(children->objectAtIndex(i))) {
+                    if (auto node = dynamic_cast<cocos2d::CCNode*>(children->objectAtIndex(i))) {
                         if (node->getPositionX() > g_mh.maxLevelX) {
                             g_mh.maxLevelX = node->getPositionX();
                         }
@@ -998,11 +1289,10 @@ class $modify(MHPlayLayerHook, PlayLayer) {
                 }
             }
         }
-        for (float frac = 0.10f; frac <= 0.90f; frac += 0.15f) {
+        for (float frac = 0.15f; frac <= 0.90f; frac += 0.15f) {
             g_mh.startPosList.push_back({g_mh.maxLevelX * frac, 105.0f});
         }
 
-        this->schedule(schedule_selector(MHPlayLayerHook::onMegaHackTick));
         return true;
     }
 
@@ -1026,7 +1316,7 @@ class $modify(MHPlayLayerHook, PlayLayer) {
 
         if (this->m_player1) {
             g_mh.runStartPct = std::clamp((this->m_player1->getPositionX() / std::max(1.0f, g_mh.maxLevelX)) * 100.0f, 0.0f, 100.0f);
-            if (g_mh.instantComplete) {
+            if (g_mh.instantComplete && !g_mh.shouldProtectProgress()) {
                 this->m_player1->setPositionX(g_mh.maxLevelX + 60.0f);
             }
         } else {
@@ -1034,16 +1324,7 @@ class $modify(MHPlayLayerHook, PlayLayer) {
         }
     }
 
-    void levelComplete() {
-        if (g_mh.shouldProtectProgress()) {
-            this->resetLevel();
-            return;
-        }
-        PlayLayer::levelComplete();
-    }
-
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        // Let RobTop's unparented anticheat test spike during init/reset pass cleanly
         auto objNode = reinterpret_cast<cocos2d::CCNode*>(obj);
         if (g_mh.inPlayLayerInit || g_mh.totalFrames < 4 || (objNode && objNode->getParent() == nullptr)) {
             PlayLayer::destroyPlayer(player, obj);
@@ -1082,267 +1363,25 @@ class $modify(MHPlayLayerHook, PlayLayer) {
 
         PlayLayer::destroyPlayer(player, obj);
     }
-
-    void onMegaHackTick(float dt) {
-        g_mh.collidingThisFrame = false;
-        g_mh.totalFrames++;
-
-        // 1. Frame Extrapolation visual smoothing
-        if (g_mh.frameExtrapolation && this->m_player1 && !g_mh.playerIsDead) {
-            cocos2d::CCPoint cur = this->m_player1->getPosition();
-            cocos2d::CCPoint delta = {cur.x - g_mh.p1PrevPos.x, cur.y - g_mh.p1PrevPos.y};
-            if (std::hypot(delta.x, delta.y) < 45.0f) {
-                g_mh.p1VelSmooth = {
-                    g_mh.p1VelSmooth.x * 0.65f + delta.x * 0.35f,
-                    g_mh.p1VelSmooth.y * 0.65f + delta.y * 0.35f
-                };
-                float alpha = std::clamp((dt * g_mh.targetFps) - 1.0f, 0.0f, 0.85f);
-                this->m_player1->setPosition({
-                    cur.x + g_mh.p1VelSmooth.x * alpha * 0.25f,
-                    cur.y + g_mh.p1VelSmooth.y * alpha * 0.25f
-                });
-            }
-            g_mh.p1PrevPos = cur;
-        } else if (this->m_player1) {
-            cocos2d::CCPoint cur = this->m_player1->getPosition();
-            g_mh.p1VelSmooth = {cur.x - g_mh.p1PrevPos.x, cur.y - g_mh.p1PrevPos.y};
-            g_mh.p1PrevPos = cur;
-        }
-
-        // 2. Player on Top
-        if (g_mh.playerOnTop) {
-            if (this->m_player1) this->m_player1->setZOrder(10000);
-            if (this->m_player2) this->m_player2->setZOrder(10000);
-        }
-
-        // 3. No Glow, No Particles & Layout Mode via pure CCNode inspection
-        if (g_mh.noGlow || g_mh.noParticles || g_mh.layoutMode) {
-            if (auto objLayer = this->getChildByID("object-layer")) {
-                if (auto children = objLayer->getChildren()) {
-                    for (unsigned int i = 0; i < children->count(); ++i) {
-                        auto child = static_cast<cocos2d::CCNode*>(children->objectAtIndex(i));
-                        if (!child || child == m_fields->m_drawOverlay) continue;
-
-                        if (g_mh.noParticles) {
-                            if (auto part = typeinfo_cast<cocos2d::CCParticleSystemQuad*>(child)) {
-                                part->setVisible(false);
-                            }
-                        }
-                        if (g_mh.noGlow || g_mh.layoutMode) {
-                            if (auto blendNode = typeinfo_cast<cocos2d::CCBlendProtocol*>(child)) {
-                                if (blendNode->getBlendFunc().dst == GL_ONE) {
-                                    child->setVisible(false);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. P1 & P2 RGB Icons
-        g_mh.rgbHue = std::fmod(g_mh.rgbHue + dt * 145.0f, 360.0f);
-        auto c1 = hsvToRgb(g_mh.rgbHue, 0.85f, 1.0f);
-        auto c2 = hsvToRgb(std::fmod(g_mh.rgbHue + 180.0f, 360.0f), 0.85f, 1.0f);
-
-        if (this->m_player1 && g_mh.p1RgbIcons) this->m_player1->setColor(c1);
-        if (this->m_player2 && g_mh.p2RgbIcons) this->m_player2->setColor(c2);
-
-        // 5. Accurate Percentage
-        if (g_mh.accuratePercentage && this->m_player1) {
-            if (auto pctLbl = typeinfo_cast<cocos2d::CCLabelBMFont*>(this->getChildByID("percentage-label"))) {
-                float pct = std::clamp((this->m_player1->getPositionX() / std::max(1.0f, g_mh.maxLevelX)) * 100.0f, 0.0f, 100.0f);
-                pctLbl->setString(formatFloat("", pct, "%", 2).c_str());
-            }
-        }
-
-        // 6. Hitbox Trail History
-        if (g_mh.hitboxTrail && this->m_player1 && !g_mh.playerIsDead) {
-            g_mh.hitboxTrailHistory.push_back(this->m_player1->boundingBox());
-            if (g_mh.hitboxTrailHistory.size() > 45) {
-                g_mh.hitboxTrailHistory.pop_front();
-            }
-        }
-
-        // 7. Trajectory & Hitbox Overlay
-        if (m_fields->m_drawOverlay) {
-            m_fields->m_drawOverlay->clear();
-            if (g_mh.showTrajectory && this->m_player1 && !g_mh.playerIsDead) {
-                drawTrajectoryLines(this->m_player1);
-            }
-            if ((g_mh.showHitboxes || (g_mh.showHitboxesOnDeath && g_mh.playerIsDead)) && this->m_player1) {
-                drawLevelHitboxes();
-            }
-        }
-
-        // 8. Status HUD
-        updateHudDisplay(dt);
-    }
-
-    void drawTrajectoryLines(PlayerObject* p) {
-        auto draw = m_fields->m_drawOverlay;
-        cocos2d::CCPoint start = p->getPosition();
-        float vx = std::max(3.2f, std::abs(g_mh.p1VelSmooth.x));
-        float vyHold = g_mh.p1VelSmooth.y;
-        float vyRel  = g_mh.p1VelSmooth.y;
-
-        cocos2d::CCPoint prevHold = start;
-        cocos2d::CCPoint prevRel  = start;
-
-        for (int i = 1; i <= 45; ++i) {
-            vyHold = std::clamp(vyHold + 0.36f, -12.f, 12.f);
-            vyRel  = std::clamp(vyRel  - 0.36f, -12.f, 12.f);
-
-            cocos2d::CCPoint nextHold = {prevHold.x + vx, std::max(0.f, prevHold.y + vyHold)};
-            cocos2d::CCPoint nextRel  = {prevRel.x  + vx, std::max(0.f, prevRel.y  + vyRel)};
-
-            draw->drawSegment(prevHold, nextHold, 0.85f, {0.2f, 0.95f, 0.45f, 0.88f});
-            draw->drawSegment(prevRel,  nextRel,  0.65f, {0.95f, 0.35f, 0.35f, 0.68f});
-
-            prevHold = nextHold;
-            prevRel  = nextRel;
-        }
-    }
-
-    void drawLevelHitboxes() {
-        auto draw = m_fields->m_drawOverlay;
-        auto drawRectBox = [&](cocos2d::CCRect r, cocos2d::ccColor4F col) {
-            cocos2d::CCPoint pts[4] = {
-                {r.getMinX(), r.getMinY()},
-                {r.getMaxX(), r.getMinY()},
-                {r.getMaxX(), r.getMaxY()},
-                {r.getMinX(), r.getMaxY()}
-            };
-            draw->drawPolygon(pts, 4, {col.r, col.g, col.b, 0.14f}, 0.65f, col);
-        };
-
-        if (g_mh.hitboxTrail) {
-            for (const auto& oldRect : g_mh.hitboxTrailHistory) {
-                drawRectBox(oldRect, {0.15f, 0.9f, 0.5f, 0.45f});
-            }
-        }
-
-        if (this->m_player1) {
-            drawRectBox(this->m_player1->boundingBox(), {0.1f, 1.0f, 0.3f, 0.95f});
-        }
-
-        if (auto objLayer = this->getChildByID("object-layer")) {
-            if (auto children = objLayer->getChildren()) {
-                float px = this->m_player1 ? this->m_player1->getPositionX() : 0.f;
-                for (unsigned int i = 0; i < children->count(); ++i) {
-                    auto node = typeinfo_cast<cocos2d::CCNode*>(children->objectAtIndex(i));
-                    if (!node || node == this->m_player1 || node == this->m_player2 || node == m_fields->m_drawOverlay) continue;
-                    if (std::abs(node->getPositionX() - px) < 260.0f) {
-                        cocos2d::CCRect r = node->boundingBox();
-                        if (r.size.width > 2.0f && r.size.width < 120.0f && r.size.height > 2.0f && r.size.height < 120.0f) {
-                            if (g_mh.hitboxMultiplier) {
-                                float cx = r.getMidX();
-                                float cy = r.getMidY();
-                                float sw = r.size.width * g_mh.hitboxScale;
-                                float sh = r.size.height * g_mh.hitboxScale;
-                                r = cocos2d::CCRect(cx - sw * 0.5f, cy - sh * 0.5f, sw, sh);
-                            }
-                            drawRectBox(r, {1.0f, 0.22f, 0.22f, 0.85f});
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    void updateHudDisplay(float dt) {
-        auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-
-        if (m_fields->m_indicatorDot) {
-            m_fields->m_indicatorDot->setVisible(g_mh.cheatIndicator);
-            if (g_mh.cheatIndicator) {
-                cocos2d::ccColor3B c = {46, 204, 113};
-                if (g_mh.isCheating()) {
-                    c = g_mh.shouldProtectProgress() ? cocos2d::ccColor3B{241, 196, 15} : cocos2d::ccColor3B{231, 76, 60};
-                }
-                m_fields->m_indicatorDot->setColor(c);
-            }
-        }
-
-        if (!m_fields->m_hudLabel) return;
-
-        if (g_mh.hudAnchor == 0) {
-            m_fields->m_hudLabel->setAnchorPoint({0.0f, 1.0f});
-            m_fields->m_hudLabel->setPosition({14.0f, winSize.height - 6.0f});
-        } else if (g_mh.hudAnchor == 1) {
-            m_fields->m_hudLabel->setAnchorPoint({1.0f, 1.0f});
-            m_fields->m_hudLabel->setPosition({winSize.width - 10.0f, winSize.height - 6.0f});
-        } else if (g_mh.hudAnchor == 2) {
-            m_fields->m_hudLabel->setAnchorPoint({0.0f, 0.0f});
-            m_fields->m_hudLabel->setPosition({14.0f, 8.0f});
-        } else {
-            m_fields->m_hudLabel->setAnchorPoint({0.5f, 1.0f});
-            m_fields->m_hudLabel->setPosition({winSize.width * 0.5f, winSize.height - 20.0f});
-        }
-
-        std::ostringstream ss;
-        if (g_mh.showFps) {
-            int fps = g_mh.frameExtrapolation
-                ? static_cast<int>(g_mh.targetFps)
-                : static_cast<int>(std::round(1.0f / std::max(dt, 0.0005f)));
-            ss << "FPS: " << fps << " (240 TPS)\n";
-        }
-        if (g_mh.showCps) {
-            float now = cocos2d::CCDirector::sharedDirector()->getTotalFrames() / 60.0f;
-            g_mh.clickTimestamps.erase(
-                std::remove_if(g_mh.clickTimestamps.begin(), g_mh.clickTimestamps.end(),
-                               [now](float t) { return (now - t) > 1.0f; }),
-                g_mh.clickTimestamps.end()
-            );
-            if (g_mh.clickTimestamps.size() > g_mh.peakCps) {
-                g_mh.peakCps = g_mh.clickTimestamps.size();
-            }
-            ss << "CPS: " << g_mh.clickTimestamps.size() << " (Peak: " << g_mh.peakCps << ")\n";
-        }
-        if (g_mh.showNoclipAccuracy) {
-            float acc = g_mh.totalFrames > 0
-                ? (1.0f - static_cast<float>(g_mh.noclipHitFrames) / static_cast<float>(g_mh.totalFrames)) * 100.0f
-                : 100.0f;
-            ss << "Accuracy: " << std::fixed << std::setprecision(2) << std::clamp(acc, 0.0f, 100.0f) << "%\n";
-        }
-        if (g_mh.showNoclipDeaths) {
-            ss << "Noclip Deaths: " << g_mh.noclipDeaths << "\n";
-        }
-        if (g_mh.showAttempts) {
-            ss << "Attempt " << g_mh.attemptCount << "\n";
-        }
-        if (g_mh.showBestRun) {
-            ss << "Best Run: " << static_cast<int>(g_mh.bestRunFrom) << "% - " << static_cast<int>(g_mh.bestRunTo) << "%\n";
-        }
-        if (g_mh.startPosSwitcher && !g_mh.startPosList.empty()) {
-            ss << "StartPos [Q/E]: " << (g_mh.currentStartPosIdx + 1) << "/" << g_mh.startPosList.size() << "\n";
-        }
-
-        m_fields->m_hudLabel->setString(ss.str().c_str());
-    }
 };
 
 // ============================================================================
-// 9. PAUSE LAYER, GARAGE & MENU HOOKS
+// 9. PAUSE LAYER, GARAGE & MENU HOOKS (PURE COCOS2D-X PILL BUTTONS)
 // ============================================================================
 class $modify(MHPauseHook, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
 
-        auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        auto menu = cocos2d::CCMenu::create();
-        menu->setPosition({0.f, 0.f});
-        this->addChild(menu, 100);
+        if (auto uiTarget = MegaHackV9Overlay::getOrCreate()) {
+            auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+            auto menu = cocos2d::CCMenu::create();
+            menu->setPosition({0.f, 0.f});
+            this->addChild(menu, 100);
 
-        auto mhSpr = ButtonSprite::create("MHv9 [Tab]", "bigFont.fnt", "GJ_button_06.png", 0.5f);
-        mhSpr->setScale(0.6f);
-        auto mhBtn = CCMenuItemSpriteExtra::create(mhSpr, this, menu_selector(MHPauseHook::onOpenModMenu));
-        mhBtn->setPosition({winSize.width - 52.0f, winSize.height - 22.0f});
-        menu->addChild(mhBtn);
-    }
-
-    void onOpenModMenu(cocos2d::CCObject*) {
-        if (auto ui = MegaHackV9Overlay::getOrCreate()) ui->toggleMenu();
+            auto btn = createPillButton("MHv9 [Tab]", uiTarget, menu_selector(MegaHackV9Overlay::onExternalToggleButton));
+            btn->setPosition({winSize.width - 42.0f, winSize.height - 18.0f});
+            menu->addChild(btn);
+        }
     }
 };
 
@@ -1354,34 +1393,22 @@ class $modify(MHMenuHook, MenuLayer) {
     }
 };
 
-class $modify(MHCreatorHook, CreatorLayer) {
-    bool init() {
-        if (!CreatorLayer::init()) return false;
-        applyCustomMenuBg(this);
-        return true;
-    }
-};
-
 class $modify(MHGarageHook, GJGarageLayer) {
     bool init() {
         if (!GJGarageLayer::init()) return false;
         applyCustomMenuBg(this);
 
-        auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        auto menu = cocos2d::CCMenu::create();
-        menu->setPosition({0.f, 0.f});
-        this->addChild(menu, 100);
+        if (auto uiTarget = MegaHackV9Overlay::getOrCreate()) {
+            auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+            auto menu = cocos2d::CCMenu::create();
+            menu->setPosition({0.f, 0.f});
+            this->addChild(menu, 100);
 
-        auto spr = ButtonSprite::create("MHv9 Effects", "bigFont.fnt", "GJ_button_06.png", 0.55f);
-        spr->setScale(0.62f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(MHGarageHook::onOpenGarageEffects));
-        btn->setPosition({winSize.width - 54.0f, winSize.height - 22.0f});
-        menu->addChild(btn);
+            auto btn = createPillButton("MHv9 RGB", uiTarget, menu_selector(MegaHackV9Overlay::onExternalToggleButton));
+            btn->setPosition({winSize.width - 42.0f, winSize.height - 18.0f});
+            menu->addChild(btn);
+        }
 
         return true;
-    }
-
-    void onOpenGarageEffects(cocos2d::CCObject*) {
-        if (auto ui = MegaHackV9Overlay::getOrCreate()) ui->toggleMenu();
     }
 };
